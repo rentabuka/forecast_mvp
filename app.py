@@ -1895,6 +1895,10 @@ st.subheader("📊 Recent Baseline & Commercial Increment")
 
 recent = weekly.tail(12).copy()
 recent["Week"] = recent["date_key"].dt.strftime("%Y-%m-%d")
+
+# Use the actual internal weekly column names first, then rename them
+# only for presentation. This prevents a KeyError when the source
+# dataframe uses underscores internally.
 recent = recent[
     [
         "Week",
@@ -1908,19 +1912,19 @@ recent = recent[
         "Promo_Depth_%",
         "Distribution",
     ]
-]
-recent.columns = [
-    "Week",
-    "Actual Units",
-    "Baseline Units",
-    "Incremental Units",
-    "Source Incremental Units",
-    "Incremental QA Gap",
-    "Sales Value",
-    "Effective RSP",
-    "Promo Depth %",
-    "Numeric Distribution %",
-]
+].rename(
+    columns={
+        "Sales_Units": "Actual Units",
+        "Baseline_Units": "Baseline Units",
+        "Incremental_Units": "Incremental Units",
+        "Source_Incremental_Units": "Source Incremental Units",
+        "Incremental_Reconciliation_Gap": "Incremental QA Gap",
+        "Sales_Value": "Sales Value",
+        "Effective_RSP": "Effective RSP",
+        "Promo_Depth_%": "Promo Depth %",
+        "Distribution": "Numeric Distribution %",
+    }
+)
 
 st.dataframe(
     recent.style.format(
