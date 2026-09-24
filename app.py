@@ -1,2486 +1,960 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-
+import warnings
 from datetime import timedelta
 
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from statsmodels.tsa.holtwinters import Holt, SimpleExpSmoothing
+from statsmodels.tsa.forecasting.theta import ThetaModel
+
 
 # ============================================================
-# 1. PAGE CONFIGURATION
+# PAGE CONFIGURATION
 # ============================================================
-
 st.set_page_config(
-    page_title="Unilever Demand & Diagnostic Engine",
+    page_title="Unilever Demand Forecast Platform",
     page_icon="📦",
-    layout="wide"
+    layout="wide",
 )
-
-
-# ============================================================
-# 2. STYLING
-# ============================================================
 
 st.markdown(
     """
     <style>
-
-    .main-header {
-        font-size: 26px;
-        font-weight: 700;
-        color: #1E3A8A;
-        margin-bottom: 20px;
-    }
-
-    .section-header {
-        font-size: 20px;
-        font-weight: 700;
-        margin-top: 20px;
-        margin-bottom: 10px;
-    }
-
-    [data-testid="stMetricValue"] {
-        font-size: 19px !important;
-        font-weight: 600 !important;
-        color: #0F172A !important;
-    }
-
-    [data-testid="stMetricLabel"] {
-        font-size: 12px !important;
-        font-weight: 500 !important;
-        color: #475569 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-
-    [data-testid="stMetricDelta"] {
-        font-size: 12px !important;
-    }
-
-    .alert-card {
-        background-color: #FEF2F2;
-        border: 1px solid #FCA5A5;
-        padding: 16px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
-
-    .warning-card {
-        background-color: #FFFBEB;
-        border: 1px solid #FCD34D;
-        padding: 16px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
-
-    .positive-card {
-        background-color: #F0FDF4;
-        border: 1px solid #86EFAC;
-        padding: 16px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
-
-    .solution-box {
-        background-color: #F8FAFC;
-        border-left: 4px solid #1E3A8A;
-        padding: 12px 16px;
-        margin-top: 10px;
-        border-radius: 4px;
-    }
-
-    .info-box {
-        background-color: #EFF6FF;
-        border: 1px solid #BFDBFE;
-        padding: 14px;
-        border-radius: 8px;
-        margin-bottom: 15px;
-    }
-
+    .main-header {font-size: 28px; font-weight: 700; margin-bottom: 8px;}
+    .subtle {color: #64748B; font-size: 13px;}
+    .card {padding: 14px 16px; border: 1px solid #E2E8F0; border-radius: 10px; background: #F8FAFC;}
+    .warning-card {padding: 14px 16px; border: 1px solid #FCD34D; border-radius: 10px; background: #FFFBEB;}
+    .success-card {padding: 14px 16px; border: 1px solid #86EFAC; border-radius: 10px; background: #F0FDF4;}
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 
 
 # ============================================================
-# 3. REQUIRED DATA SCHEMA
+# DATA CONTRACT
 # ============================================================
-
-EXACT_REQUIRED_COLUMNS = [
+REQUIRED_COLUMNS = [
+    "26 Weeks CY Value",
     "Full Date",
-    "Category",
-    "Subcategory",
     "Brand",
-    "ProductsID",
+    "Category",
     "Product",
-    "52 Weeks CY Value",
-    "52 Weeks CY Ave Price Quantity",
-    "52 Weeks CY Ave RSP On Promo"
+    "ProductsID",
+    "Subcategory",
+    "26 Weeks CY Ave Price Quantity",
+    "26 Weeks CY Ave RSP On Promo",
 ]
 
 
 # ============================================================
-# 4. DATA VALIDATION AND PREPROCESSING
+# HELPERS
 # ============================================================
+def clean_number(series):
+    """Convert numeric-like values safely."""
+    return pd.to_numeric(series, errors="coerce")
 
-def validate_and_preprocess(df):
-    """
-    Validate the uploaded dataset and create clean analytical fields.
-    """
 
+def validate_and_prepare(raw_df):
+    """Validate and create clean row-level analytical fields."""
+    missing = [c for c in REQUIRED_COLUMNS if c not in raw_df.columns]
+    if missing:
+        return False, [f"Missing required columns: {', '.join(missing)}"], [], None
+
+    df = raw_df.copy()
     errors = []
-    warnings = []
+    warnings_list = []
 
-    # --------------------------------------------------------
-    # Required columns
-    # --------------------------------------------------------
-
-    missing_cols = [
-        col for col in EXACT_REQUIRED_COLUMNS
-        if col not in df.columns
-    ]
-
-    if missing_cols:
-        errors.append(
-            "Missing required columns: "
-            + ", ".join(missing_cols)
-        )
-
-        return False, errors, warnings, None
-
-    df_clean = df.copy()
-
-    # --------------------------------------------------------
     # Date
-    # --------------------------------------------------------
+    df["date_key"] = pd.to_datetime(df["Full Date"], errors="coerce")
+    bad_dates = int(df["date_key"].isna().sum())
+    if bad_dates:
+        warnings_list.append(f"{bad_dates:,} rows have invalid dates and were removed.")
+        df = df.dropna(subset=["date_key"]).copy()
 
-    df_clean["date_key"] = pd.to_datetime(
-        df_clean["Full Date"],
-        errors="coerce"
+    if df.empty:
+        return False, ["No valid dated rows remain after date validation."], warnings_list, None
+
+    # Numeric fields
+    df["Sales Value"] = clean_number(df["26 Weeks CY Value"]).fillna(0).clip(lower=0)
+    df["Ave RSP"] = clean_number(df["26 Weeks CY Ave Price Quantity"])
+    df["Promo RSP"] = clean_number(df["26 Weeks CY Ave RSP On Promo"])
+
+    # IMPORTANT: do not round units row-by-row. Keep decimals and round only for display.
+    df["Sales Units"] = np.where(
+        df["Ave RSP"] > 0,
+        df["Sales Value"] / df["Ave RSP"],
+        np.nan,
     )
-
-    if df_clean["date_key"].isna().all():
-        errors.append(
-            "Full Date could not be converted into valid dates."
-        )
-        return False, errors, warnings, None
-
-    invalid_dates = df_clean["date_key"].isna().sum()
-
-    if invalid_dates > 0:
-        warnings.append(
-            f"{invalid_dates:,} rows contain invalid dates and will be excluded."
-        )
-
-        df_clean = df_clean.dropna(
-            subset=["date_key"]
-        ).copy()
-
-    # --------------------------------------------------------
-    # Numeric conversion
-    # --------------------------------------------------------
-
-    df_clean["Sales Value"] = pd.to_numeric(
-        df_clean["52 Weeks CY Value"],
-        errors="coerce"
-    )
-
-    df_clean["Ave RSP"] = pd.to_numeric(
-        df_clean["52 Weeks CY Ave Price Quantity"],
-        errors="coerce"
-    )
-
-    df_clean["Promo RSP"] = pd.to_numeric(
-        df_clean["52 Weeks CY Ave RSP On Promo"],
-        errors="coerce"
-    )
-
-    # Missing values
-    df_clean["Sales Value"] = (
-        df_clean["Sales Value"]
-        .fillna(0)
-        .clip(lower=0)
-    )
-
-    df_clean["Ave RSP"] = (
-        df_clean["Ave RSP"]
-        .replace([np.inf, -np.inf], np.nan)
-    )
-
-    df_clean["Promo RSP"] = (
-        df_clean["Promo RSP"]
-        .replace([np.inf, -np.inf], np.nan)
-    )
-
-    # --------------------------------------------------------
-    # Promo RSP fallback
-    # --------------------------------------------------------
-
-    df_clean["Promo RSP"] = df_clean["Promo RSP"].fillna(
-        df_clean["Ave RSP"]
-    )
-
-    # --------------------------------------------------------
-    # Sales Units
-    # --------------------------------------------------------
-
-    df_clean["Sales Units"] = np.where(
-        df_clean["Ave RSP"] > 0,
-        df_clean["Sales Value"] / df_clean["Ave RSP"],
-        np.nan
-    )
-
-    df_clean["Sales Units"] = (
-        df_clean["Sales Units"]
+    df["Sales Units"] = (
+        pd.Series(df["Sales Units"])
         .replace([np.inf, -np.inf], np.nan)
         .fillna(0)
         .clip(lower=0)
+        .to_numpy()
     )
 
-    # --------------------------------------------------------
-    # Numeric Distribution
-    # --------------------------------------------------------
-
-    if "Numeric Distribution" in df_clean.columns:
-
-        df_clean["Numeric Distribution"] = pd.to_numeric(
-            df_clean["Numeric Distribution"],
-            errors="coerce"
-        )
-
-        # Detect whether distribution is stored as 0-1
-        valid_dist = df_clean["Numeric Distribution"].dropna()
-
-        if not valid_dist.empty and valid_dist.max() <= 1.0:
-            df_clean["Numeric Distribution"] *= 100
-
-        df_clean["Numeric Distribution"] = (
-            df_clean["Numeric Distribution"]
-            .clip(lower=0, upper=100)
-        )
-
+    # Optional Numeric Distribution. We do not invent a value if it is absent.
+    if "Numeric Distribution" in df.columns:
+        dist = clean_number(df["Numeric Distribution"])
+        non_null = dist.dropna()
+        if not non_null.empty and non_null.max() <= 1.0:
+            dist = dist * 100
+        df["Numeric Distribution"] = dist.clip(lower=0, upper=100)
     else:
-
-        df_clean["Numeric Distribution"] = np.nan
-
-        warnings.append(
-            "Numeric Distribution was not found. "
-            "Distribution diagnostics will be unavailable."
+        df["Numeric Distribution"] = np.nan
+        warnings_list.append(
+            "Numeric Distribution is not present in this file; distribution will be shown as unavailable."
         )
 
-    # --------------------------------------------------------
-    # Promotion depth
-    # --------------------------------------------------------
+    for col in ["Category", "Subcategory", "Brand", "Product"]:
+        df[col] = df[col].fillna("Unknown").astype(str)
 
-    df_clean["Promo Depth %"] = np.where(
-        df_clean["Ave RSP"] > 0,
-        (
-            (df_clean["Ave RSP"] - df_clean["Promo RSP"])
-            / df_clean["Ave RSP"]
-        ) * 100,
-        np.nan
+    df["ProductsID"] = df["ProductsID"].astype(str)
+
+    # Diagnostics only; not directly fed into the baseline forecast.
+    df["Promo Depth %"] = np.where(
+        df["Ave RSP"] > 0,
+        ((df["Ave RSP"] - df["Promo RSP"]) / df["Ave RSP"]) * 100,
+        np.nan,
     )
-
-    df_clean["Promo Depth %"] = (
-        df_clean["Promo Depth %"]
+    df["Promo Depth %"] = (
+        df["Promo Depth %"]
         .replace([np.inf, -np.inf], np.nan)
         .clip(lower=0, upper=100)
     )
 
-    # --------------------------------------------------------
-    # Product names
-    # --------------------------------------------------------
+    return True, errors, warnings_list, df.sort_values("date_key").reset_index(drop=True)
 
-    for col in [
-        "Category",
-        "Subcategory",
-        "Brand",
-        "ProductsID",
-        "Product"
-    ]:
-
-        df_clean[col] = (
-            df_clean[col]
-            .fillna("Unknown")
-            .astype(str)
-        )
-
-    # --------------------------------------------------------
-    # Sort
-    # --------------------------------------------------------
-
-    df_clean = df_clean.sort_values(
-        "date_key"
-    ).reset_index(drop=True)
-
-    # --------------------------------------------------------
-    # Data quality warnings
-    # --------------------------------------------------------
-
-    number_of_dates = df_clean["date_key"].nunique()
-
-    if number_of_dates < 12:
-
-        warnings.append(
-            f"Only {number_of_dates} unique dates were found. "
-            "Forecast reliability will be limited."
-        )
-
-    elif number_of_dates < 26:
-
-        warnings.append(
-            f"Only {number_of_dates} unique dates were found. "
-            "At least 52 weekly observations are recommended."
-        )
-
-    # --------------------------------------------------------
-    # Important semantic warning
-    # --------------------------------------------------------
-
-    if number_of_dates > 1:
-
-        date_diff = (
-            df_clean["date_key"]
-            .sort_values()
-            .drop_duplicates()
-            .diff()
-            .dt.days
-            .dropna()
-        )
-
-        if not date_diff.empty:
-
-            median_gap = date_diff.median()
-
-            if median_gap > 10:
-
-                warnings.append(
-                    "The dates do not appear to be weekly. "
-                    f"Median date gap is approximately {median_gap:.0f} days."
-                )
-
-    return True, errors, warnings, df_clean
-
-
-# ============================================================
-# 5. WEEKLY AGGREGATION
-# ============================================================
 
 def aggregate_weekly(df):
     """
-    Aggregate the selected portfolio/SKU scope to weekly level.
+    The source is already weekly. Group by the actual Full Date instead of
+    resampling into artificial week buckets.
     """
-
     if df.empty:
         return pd.DataFrame()
 
-    weekly = (
-        df.set_index("date_key")
-        .groupby(pd.Grouper(freq="W-SUN"))
+    grouped = (
+        df.groupby("date_key", as_index=False)
         .agg(
-            {
-                "Sales Value": "sum",
-                "Sales Units": "sum",
-                "Numeric Distribution": "mean",
-                "Promo Depth %": "mean",
-                "Ave RSP": "mean",
-                "Promo RSP": "mean"
-            }
+            Sales_Units=("Sales Units", "sum"),
+            Sales_Value=("Sales Value", "sum"),
+            Distribution=("Numeric Distribution", "mean"),
+            Avg_RSP=("Ave RSP", "mean"),
+            Promo_RSP=("Promo RSP", "mean"),
         )
-        .reset_index()
-    )
-
-    weekly = weekly.sort_values(
-        "date_key"
-    ).reset_index(drop=True)
-
-    # --------------------------------------------------------
-    # Effective selling price
-    # --------------------------------------------------------
-
-    weekly["Effective RSP"] = np.where(
-        weekly["Sales Units"] > 0,
-        weekly["Sales Value"] / weekly["Sales Units"],
-        np.nan
-    )
-
-    return weekly
-
-
-# ============================================================
-# 6. TREND CALCULATION
-# ============================================================
-
-def calculate_trend(values):
-    """
-    Calculate a simple linear trend using historical observations.
-
-    Returns a weekly percentage trend.
-    """
-
-    values = pd.Series(values).dropna()
-
-    if len(values) < 6:
-        return 0.0
-
-    # Use recent history so old structural changes don't dominate.
-    lookback = min(13, len(values))
-
-    recent = values.tail(
-        lookback
-    ).values
-
-    if np.all(recent <= 0):
-        return 0.0
-
-    x = np.arange(
-        len(recent),
-        dtype=float
-    )
-
-    try:
-
-        slope = np.polyfit(
-            x,
-            recent,
-            1
-        )[0]
-
-        average = np.mean(recent)
-
-        if average <= 0:
-            return 0.0
-
-        trend = slope / average
-
-        # Dampen extreme trends.
-        trend = np.clip(
-            trend,
-            -0.05,
-            0.05
-        )
-
-        return float(trend)
-
-    except Exception:
-        return 0.0
-
-
-# ============================================================
-# 7. SEASONALITY
-# ============================================================
-
-def calculate_seasonality(df, target_col):
-    """
-    Estimate annual weekly seasonality when at least
-    approximately one year of data exists.
-
-    With less than 52 observations, no annual seasonality
-    is imposed.
-    """
-
-    if len(df) < 52:
-        return {}
-
-    temp = df[
-        ["date_key", target_col]
-    ].dropna().copy()
-
-    if temp.empty:
-        return {}
-
-    temp["week_of_year"] = (
-        temp["date_key"]
-        .dt.isocalendar()
-        .week
-        .astype(int)
-    )
-
-    overall_mean = temp[target_col].mean()
-
-    if overall_mean <= 0:
-        return {}
-
-    seasonal = (
-        temp.groupby("week_of_year")[target_col]
-        .mean()
-        / overall_mean
-    )
-
-    # Limit extreme seasonality.
-    seasonal = seasonal.clip(
-        lower=0.70,
-        upper=1.30
-    )
-
-    return seasonal.to_dict()
-
-
-# ============================================================
-# 8. FORECAST BASELINE
-# ============================================================
-
-def forecast_series(
-    history,
-    periods=4,
-    seasonal_factors=None
-):
-    """
-    Forecast future values using:
-
-    - Recent weighted run-rate
-    - Recent trend
-    - Annual seasonality when available
-
-    No random noise is used.
-    """
-
-    values = (
-        pd.Series(history)
-        .astype(float)
-        .fillna(0)
-        .clip(lower=0)
-    )
-
-    if len(values) == 0:
-        return np.zeros(periods)
-
-    # --------------------------------------------------------
-    # Recent weighted run-rate
-    # --------------------------------------------------------
-
-    lookback = min(6, len(values))
-
-    recent = values.tail(
-        lookback
-    ).values
-
-    weights = np.arange(
-        1,
-        len(recent) + 1
-    )
-
-    weighted_average = np.average(
-        recent,
-        weights=weights
-    )
-
-    # --------------------------------------------------------
-    # Trend
-    # --------------------------------------------------------
-
-    trend = calculate_trend(values)
-
-    forecasts = []
-
-    last_value = weighted_average
-
-    for i in range(1, periods + 1):
-
-        # Dampen trend as we move further into the future.
-        damped_trend = trend * (0.75 ** (i - 1))
-
-        forecast = (
-            weighted_average
-            * (1 + damped_trend * i)
-        )
-
-        # ----------------------------------------------------
-        # Seasonality
-        # ----------------------------------------------------
-
-        if seasonal_factors:
-
-            future_position = len(values) + i
-
-            # Approximate week position
-            seasonal_index = (
-                future_position - 1
-            ) % 52 + 1
-
-            seasonal_factor = seasonal_factors.get(
-                seasonal_index,
-                1.0
-            )
-
-            forecast *= seasonal_factor
-
-        # Prevent negative forecast.
-        forecast = max(
-            0,
-            forecast
-        )
-
-        forecasts.append(
-            forecast
-        )
-
-        last_value = forecast
-
-    return np.array(
-        forecasts
-    )
-
-
-# ============================================================
-# 9. FORECAST ERROR / PREDICTION RANGE
-# ============================================================
-
-def calculate_backtest_errors(
-    history,
-    minimum_training=12,
-    horizon=4
-):
-    """
-    Rolling-origin backtest.
-
-    This gives us an empirical distribution of historical
-    forecast errors which can be used to create a forecast
-    range.
-
-    This is much more defensible than simply using +/- 12%.
-    """
-
-    values = (
-        pd.Series(history)
-        .astype(float)
-        .fillna(0)
-        .clip(lower=0)
+        .sort_values("date_key")
         .reset_index(drop=True)
     )
 
-    if len(values) < minimum_training + horizon:
-        return np.array([])
-
-    errors = []
-
-    for split in range(
-        minimum_training,
-        len(values) - horizon + 1
-    ):
-
-        train = values.iloc[
-            :split
-        ]
-
-        actual = values.iloc[
-            split:split + horizon
-        ]
-
-        forecast = forecast_series(
-            train,
-            periods=horizon
-        )
-
-        for pred, obs in zip(
-            forecast,
-            actual
-        ):
-
-            if obs > 0:
-
-                error = (
-                    pred - obs
-                ) / obs
-
-                errors.append(
-                    error
-                )
-
-    return np.array(
-        errors
+    # Scope-level effective selling price. This is much better than averaging
+    # SKU prices equally when SKUs have very different volumes.
+    grouped["Effective_RSP"] = np.where(
+        grouped["Sales_Units"] > 0,
+        grouped["Sales_Value"] / grouped["Sales_Units"],
+        np.nan,
     )
+
+    grouped["Promo_Depth_%"] = np.where(
+        (grouped["Avg_RSP"] > 0) & grouped["Promo_RSP"].notna(),
+        ((grouped["Avg_RSP"] - grouped["Promo_RSP"]) / grouped["Avg_RSP"]) * 100,
+        np.nan,
+    )
+    grouped["Promo_Depth_%"] = grouped["Promo_Depth_%"].clip(0, 100)
+
+    return grouped
+
+
+def is_constant_or_empty(y):
+    y = np.asarray(y, dtype=float)
+    if len(y) == 0:
+        return True
+    if np.allclose(y, 0):
+        return True
+    return np.nanstd(y) < 1e-10
 
 
 # ============================================================
-# 10. FORECAST INTERVAL
+# FORECAST CANDIDATES
 # ============================================================
+def forecast_naive(y, horizon):
+    y = np.asarray(y, dtype=float)
+    return np.repeat(max(0.0, y[-1]), horizon)
 
-def create_prediction_interval(
-    forecast,
-    historical_errors
-):
-    """
-    Create an empirical forecast range based on historical
-    forecast errors.
-    """
 
-    forecast = np.asarray(
-        forecast,
-        dtype=float
-    )
+def forecast_ma4(y, horizon):
+    y = np.asarray(y, dtype=float)
+    n = min(4, len(y))
+    return np.repeat(max(0.0, float(np.mean(y[-n:]))), horizon)
 
-    if (
-        historical_errors is None
-        or len(historical_errors) < 10
-    ):
 
-        # Not enough evidence for a statistical interval.
-        # Return a conservative illustrative range.
-        lower_factor = 0.85
-        upper_factor = 1.15
+def forecast_ma6(y, horizon):
+    y = np.asarray(y, dtype=float)
+    n = min(6, len(y))
+    return np.repeat(max(0.0, float(np.mean(y[-n:]))), horizon)
 
-        return (
-            forecast * lower_factor,
-            forecast * upper_factor,
-            False
+
+def forecast_wma6(y, horizon):
+    y = np.asarray(y, dtype=float)
+    n = min(6, len(y))
+    recent = y[-n:]
+    weights = np.arange(1, n + 1, dtype=float)
+    level = np.average(recent, weights=weights)
+    return np.repeat(max(0.0, float(level)), horizon)
+
+
+def forecast_median6(y, horizon):
+    y = np.asarray(y, dtype=float)
+    n = min(6, len(y))
+    return np.repeat(max(0.0, float(np.median(y[-n:]))), horizon)
+
+
+def forecast_ses(y, horizon):
+    y = np.asarray(y, dtype=float)
+    if is_constant_or_empty(y):
+        return forecast_naive(y, horizon)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = SimpleExpSmoothing(y, initialization_method="estimated").fit(optimized=True)
+    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
+
+
+def forecast_log_ses(y, horizon):
+    y = np.asarray(y, dtype=float)
+    if is_constant_or_empty(y):
+        return forecast_naive(y, horizon)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = SimpleExpSmoothing(np.log1p(np.maximum(y, 0)), initialization_method="estimated").fit(
+            optimized=True
         )
+    return np.maximum(0.0, np.expm1(np.asarray(fit.forecast(horizon), dtype=float)))
 
-    lower_error = np.nanpercentile(
-        historical_errors,
-        10
-    )
 
-    upper_error = np.nanpercentile(
-        historical_errors,
-        90
-    )
+def forecast_damped_holt(y, horizon):
+    y = np.asarray(y, dtype=float)
+    if len(y) < 5 or is_constant_or_empty(y):
+        return forecast_ses(y, horizon)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = Holt(
+            y,
+            initialization_method="estimated",
+            damped_trend=True,
+        ).fit(optimized=True)
+    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
 
-    lower = forecast * (
-        1 + lower_error
-    )
 
-    upper = forecast * (
-        1 + upper_error
-    )
+def forecast_theta(y, horizon):
+    y = np.asarray(y, dtype=float)
+    if len(y) < 8 or is_constant_or_empty(y):
+        return forecast_ses(y, horizon)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = ThetaModel(y, period=1).fit()
+    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
 
-    lower = np.maximum(
-        0,
-        lower
-    )
 
-    return (
-        lower,
-        upper,
-        True
-    )
+def forecast_seasonal_naive52(y, horizon):
+    y = np.asarray(y, dtype=float)
+    if len(y) < 52:
+        raise ValueError("Need at least 52 observations for seasonal-naive-52.")
+    out = []
+    for i in range(horizon):
+        out.append(max(0.0, y[-52 + i]))
+    return np.asarray(out, dtype=float)
+
+
+def forecast_croston_sba(y, horizon, alpha=0.10):
+    """Simple Croston-SBA for intermittent SKU demand."""
+    y = np.asarray(y, dtype=float)
+    if len(y) == 0:
+        return np.zeros(horizon)
+    nz = np.flatnonzero(y > 0)
+    if len(nz) == 0:
+        return np.zeros(horizon)
+
+    first = int(nz[0])
+    demand_est = float(y[first])
+    interval_est = float(max(1, first + 1))
+    last_event = first
+
+    for t in range(first + 1, len(y)):
+        if y[t] > 0:
+            interval = float(max(1, t - last_event))
+            demand_est = demand_est + alpha * (y[t] - demand_est)
+            interval_est = interval_est + alpha * (interval - interval_est)
+            last_event = t
+
+    forecast = (1.0 - alpha / 2.0) * demand_est / max(interval_est, 1e-9)
+    return np.repeat(max(0.0, forecast), horizon)
+
+
+def get_model_registry(n_obs, intermittent=False):
+    models = {
+        "Naive Last Week": forecast_naive,
+        "4-Week Moving Average": forecast_ma4,
+        "6-Week Moving Average": forecast_ma6,
+        "Weighted 6-Week Average": forecast_wma6,
+        "6-Week Median": forecast_median6,
+        "Simple Exponential Smoothing": forecast_ses,
+        "Log Exponential Smoothing": forecast_log_ses,
+        "Damped Holt": forecast_damped_holt,
+        "Theta": forecast_theta,
+    }
+
+    if n_obs >= 56:
+        # A 4-week rolling backtest needs at least 52 weeks of training
+        # plus the 4-week validation horizon before Seasonal Naive can
+        # be evaluated fairly.
+        models["Seasonal Naive (52 Weeks)"] = forecast_seasonal_naive52
+
+    if intermittent:
+        models["Croston-SBA"] = forecast_croston_sba
+
+    return models
 
 
 # ============================================================
-# 11. FULL FORECAST ENGINE
+# BACKTESTING
 # ============================================================
+def wmape(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    denominator = np.sum(np.abs(actual))
+    if denominator <= 0:
+        return np.nan
+    return 100.0 * np.sum(np.abs(actual - pred)) / denominator
 
-def compute_forecast(
-    df_aggregated,
-    periods=4
-):
-    """
-    Generate the full historical + forecast dataset.
-    """
 
-    if df_aggregated.empty:
-        return pd.DataFrame(), {}
+def smape(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    denominator = np.abs(actual) + np.abs(pred)
+    terms = np.where(denominator > 0, 2 * np.abs(actual - pred) / denominator, 0)
+    return 100.0 * np.mean(terms)
 
-    df = (
-        df_aggregated
-        .sort_values("date_key")
-        .copy()
-    )
 
-    # Keep all available history for modelling.
-    unit_history = (
-        df["Sales Units"]
-        .fillna(0)
-        .values
-    )
+def select_backtest_setup(n_obs, requested_horizon=4):
+    """Use a true 4-week horizon when enough data exists."""
+    horizon = min(requested_horizon, max(1, n_obs // 4))
 
-    value_history = (
-        df["Sales Value"]
-        .fillna(0)
-        .values
-    )
+    if n_obs >= 20:
+        min_train = 12
+    elif n_obs >= 16:
+        min_train = 10
+    elif n_obs >= 12:
+        min_train = 8
+    else:
+        min_train = max(4, n_obs - horizon - 1)
 
-    # --------------------------------------------------------
-    # Seasonality
-    # --------------------------------------------------------
+    n_origins = max(0, n_obs - horizon - min_train + 1)
+    return horizon, min_train, n_origins
 
-    unit_seasonality = calculate_seasonality(
-        df,
-        "Sales Units"
-    )
 
-    value_seasonality = calculate_seasonality(
-        df,
-        "Sales Value"
-    )
+def backtest_model(y, model_name, model_func, horizon, min_train):
+    y = np.asarray(y, dtype=float)
+    rows = []
 
-    # --------------------------------------------------------
-    # Forecast
-    # --------------------------------------------------------
+    for split in range(min_train, len(y) - horizon + 1):
+        train = y[:split]
+        actual = y[split : split + horizon]
 
-    unit_forecast = forecast_series(
-        unit_history,
-        periods=periods,
-        seasonal_factors=unit_seasonality
-    )
+        try:
+            pred = np.asarray(model_func(train, horizon), dtype=float)
+        except Exception:
+            continue
 
-    value_forecast = forecast_series(
-        value_history,
-        periods=periods,
-        seasonal_factors=value_seasonality
-    )
+        if len(pred) != horizon or not np.all(np.isfinite(pred)):
+            continue
 
-    # --------------------------------------------------------
-    # Backtest errors
-    # --------------------------------------------------------
+        pred = np.maximum(pred, 0.0)
 
-    unit_errors = calculate_backtest_errors(
-        unit_history,
-        horizon=periods
-    )
+        for h, (p, a) in enumerate(zip(pred, actual), start=1):
+            rows.append(
+                {
+                    "Model": model_name,
+                    "Horizon": h,
+                    "Actual": float(a),
+                    "Prediction": float(p),
+                    "Error": float(p - a),
+                    "AbsError": float(abs(p - a)),
+                    "AbsPctError": float(abs(p - a) / a) if a > 0 else np.nan,
+                    "RelError": float((p - a) / a) if a > 0 else np.nan,
+                }
+            )
 
-    value_errors = calculate_backtest_errors(
-        value_history,
-        horizon=periods
-    )
+    return pd.DataFrame(rows)
 
-    unit_lower, unit_upper, unit_empirical = (
-        create_prediction_interval(
-            unit_forecast,
-            unit_errors
-        )
-    )
 
-    value_lower, value_upper, value_empirical = (
-        create_prediction_interval(
-            value_forecast,
-            value_errors
-        )
-    )
+def evaluate_models(y, horizon=4):
+    """Evaluate candidate models and select the champion by WMAPE."""
+    y = np.asarray(y, dtype=float)
+    intermittent = np.mean(y <= 0) >= 0.20
+    models = get_model_registry(len(y), intermittent=intermittent)
+    actual_horizon, min_train, n_origins = select_backtest_setup(len(y), horizon)
 
-    # --------------------------------------------------------
-    # Historical
-    # --------------------------------------------------------
+    score_rows = []
+    detail_rows = []
 
-    historical = df[
-        [
-            "date_key",
-            "Sales Units",
-            "Sales Value",
-            "Numeric Distribution",
-            "Promo Depth %",
-            "Effective RSP"
-        ]
-    ].copy()
+    if n_origins <= 0:
+        return pd.DataFrame(), pd.DataFrame(), None, actual_horizon, min_train, n_origins
 
-    historical["Type"] = "Historical"
+    for name, func in models.items():
+        details = backtest_model(y, name, func, actual_horizon, min_train)
+        if details.empty:
+            continue
 
-    historical["units_p10"] = np.nan
-    historical["units_p90"] = np.nan
-    historical["value_p10"] = np.nan
-    historical["value_p90"] = np.nan
-
-    # --------------------------------------------------------
-    # Future dates
-    # --------------------------------------------------------
-
-    last_date = df["date_key"].max()
-
-    future_rows = []
-
-    for i in range(
-        periods
-    ):
-
-        future_date = (
-            last_date
-            + timedelta(weeks=i + 1)
-        )
-
-        forecast_units = unit_forecast[i]
-        forecast_value = value_forecast[i]
-
-        future_rows.append(
+        detail_rows.append(details)
+        score_rows.append(
             {
-                "date_key": future_date,
-                "Sales Units": forecast_units,
-                "Sales Value": forecast_value,
-                "Numeric Distribution": np.nan,
-                "Promo Depth %": np.nan,
-                "Effective RSP": (
-                    forecast_value / forecast_units
-                    if forecast_units > 0
-                    else np.nan
-                ),
-                "Type": "Forecast",
-                "units_p10": unit_lower[i],
-                "units_p90": unit_upper[i],
-                "value_p10": value_lower[i],
-                "value_p90": value_upper[i]
+                "Model": name,
+                "WMAPE %": wmape(details["Actual"], details["Prediction"]),
+                "sMAPE %": smape(details["Actual"], details["Prediction"]),
+                "Bias %": 100.0 * details["Error"].sum() / max(details["Actual"].sum(), 1e-9),
+                "Forecasts Tested": len(details),
             }
         )
 
-    forecast_df = pd.DataFrame(
-        future_rows
-    )
+    scores = pd.DataFrame(score_rows)
+    details_all = pd.concat(detail_rows, ignore_index=True) if detail_rows else pd.DataFrame()
 
-    combined = pd.concat(
-        [
-            historical,
-            forecast_df
-        ],
-        ignore_index=True
-    )
+    if scores.empty:
+        return scores, details_all, None, actual_horizon, min_train, n_origins
 
-    metadata = {
-        "unit_empirical_interval": unit_empirical,
-        "value_empirical_interval": value_empirical,
-        "unit_errors": unit_errors,
-        "value_errors": value_errors,
-        "unit_seasonality": unit_seasonality,
-        "value_seasonality": value_seasonality
-    }
+    # Primary: WMAPE. Tie-break: absolute bias.
+    scores["Abs Bias"] = scores["Bias %"].abs()
+    scores = scores.sort_values(["WMAPE %", "Abs Bias"]).reset_index(drop=True)
+    champion = scores.iloc[0]["Model"]
 
-    return combined, metadata
+    return scores, details_all, champion, actual_horizon, min_train, n_origins
+
+
+def build_prediction_intervals(champion_details, future_forecast):
+    """Use empirical relative errors from backtests, horizon by horizon."""
+    f = np.asarray(future_forecast, dtype=float)
+    lower = np.zeros(len(f))
+    upper = np.zeros(len(f))
+
+    global_errors = champion_details["RelError"].dropna().to_numpy()
+
+    for i in range(len(f)):
+        h = i + 1
+        horizon_errors = champion_details.loc[
+            champion_details["Horizon"] == h, "RelError"
+        ].dropna().to_numpy()
+
+        errors = horizon_errors if len(horizon_errors) >= 5 else global_errors
+
+        if len(errors) >= 5:
+            q10 = np.quantile(errors, 0.10)
+            q90 = np.quantile(errors, 0.90)
+        else:
+            q10, q90 = -0.15, 0.15
+
+        lower[i] = max(0.0, f[i] * (1.0 + q10))
+        upper[i] = max(lower[i], f[i] * (1.0 + q90))
+
+    return lower, upper
 
 
 # ============================================================
-# 12. YEAR-ON-YEAR COMPARISON
+# MODEL FORECAST
 # ============================================================
+def run_forecast(series, horizon=4):
+    """Backtest, select champion, fit champion on all history and forecast."""
+    y = np.asarray(series, dtype=float)
+    scores, details, champion, bt_horizon, min_train, n_origins = evaluate_models(y, horizon=horizon)
 
-def calculate_yoy_comparison(
-    weekly,
-    forecast_df
-):
-    """
-    Compare forecast against actual same-period-last-year
-    data where 52+ weeks are available.
+    # If too little data for selection, use a transparent fallback.
+    if champion is None:
+        champion = "Naive Last Week"
+        model_func = forecast_naive
+        fallback_reason = "Insufficient history for meaningful model comparison."
+    else:
+        model_func = get_model_registry(
+            len(y), intermittent=np.mean(y <= 0) >= 0.20
+        )[champion]
+        fallback_reason = None
 
-    No synthetic LY data is generated.
-    """
+    future = np.asarray(model_func(y, horizon), dtype=float)
+    future = np.maximum(future, 0.0)
 
-    result = {
-        "available": False,
-        "forecast_units": forecast_df["Sales Units"].sum(),
-        "forecast_value": forecast_df["Sales Value"].sum(),
-        "ly_units": np.nan,
-        "ly_value": np.nan,
-        "unit_growth": np.nan,
-        "value_growth": np.nan,
-        "unit_change": np.nan,
-        "value_change": np.nan
+    champion_details = (
+        details[details["Model"] == champion].copy()
+        if not details.empty
+        else pd.DataFrame()
+    )
+
+    if champion_details.empty:
+        lower = future * 0.85
+        upper = future * 1.15
+        interval_method = "Indicative ±15% because insufficient backtest errors are available."
+    else:
+        lower, upper = build_prediction_intervals(champion_details, future)
+        interval_method = "Empirical 10th–90th percentile of rolling backtest relative errors."
+
+    return {
+        "forecast": future,
+        "lower": lower,
+        "upper": upper,
+        "champion": champion,
+        "scores": scores,
+        "details": details,
+        "bt_horizon": bt_horizon,
+        "min_train": min_train,
+        "n_origins": n_origins,
+        "interval_method": interval_method,
+        "fallback_reason": fallback_reason,
     }
 
-    if weekly.empty:
-        return result
 
-    # Need at least approximately one year.
-    if len(weekly) < 53:
-        return result
+# ============================================================
+# DRIVER DIAGNOSTICS (FACTUAL, NOT CAUSAL)
+# ============================================================
+def recent_change(series, recent_n=4, prior_n=4):
+    s = pd.Series(series).dropna()
+    if len(s) < recent_n + prior_n:
+        return np.nan
+    recent = s.iloc[-recent_n:].mean()
+    prior = s.iloc[-recent_n - prior_n : -recent_n].mean()
+    if prior == 0:
+        return np.nan
+    return 100.0 * (recent / prior - 1.0)
 
-    weekly = weekly.sort_values(
-        "date_key"
-    ).copy()
 
-    last_date = weekly["date_key"].max()
+def build_driver_summary(weekly):
+    items = []
 
-    forecast_dates = forecast_df[
-        "date_key"
-    ]
+    unit_change = recent_change(weekly["Sales_Units"])
+    price_change = recent_change(weekly["Effective_RSP"])
+    promo_change = recent_change(weekly["Promo_Depth_%"])
+    dist_change = recent_change(weekly["Distribution"])
 
-    if forecast_dates.empty:
-        return result
+    if np.isfinite(unit_change):
+        items.append(("Volume", f"Latest 4-week average volume is {unit_change:+.1f}% vs the preceding 4 weeks."))
+    if np.isfinite(price_change):
+        items.append(("Price", f"Effective RSP changed {price_change:+.1f}% on a 4-week-vs-4-week basis."))
+    if np.isfinite(promo_change):
+        items.append(("Promotion", f"Observed promotional depth changed {promo_change:+.1f}% vs the preceding 4 weeks."))
+    if np.isfinite(dist_change):
+        items.append(("Distribution", f"Numeric distribution changed {dist_change:+.1f}% vs the preceding 4 weeks."))
 
-    # --------------------------------------------------------
-    # Compare each forecast week to approximately 52 weeks
-    # earlier.
-    # --------------------------------------------------------
+    return items
 
+
+# ============================================================
+# UI
+# ============================================================
+st.markdown('<div class="main-header">Unilever Demand & Forecast Platform</div>', unsafe_allow_html=True)
+st.caption(
+    "Automatic model selection using rolling-origin backtesting. "
+    "The platform does not manufacture YoY benchmarks or promotional uplift assumptions."
+)
+
+with st.sidebar:
+    st.header("📥 Data & Filters")
+    uploaded_file = st.file_uploader("Upload weekly sales CSV", type=["csv"])
+
+if uploaded_file is None:
+    st.info("Upload the weekly CSV to start the forecast.")
+    st.markdown(
+        """
+        **Minimum recommended history:** 12 weeks.
+
+        **Preferred:** 52+ weeks if you want true same-period-last-year comparison and annual seasonality.
+        """
+    )
+    st.stop()
+
+try:
+    raw_df = pd.read_csv(uploaded_file)
+except Exception as exc:
+    st.error(f"Could not read the CSV: {exc}")
+    st.stop()
+
+valid, errors, warning_list, df_clean = validate_and_prepare(raw_df)
+
+if not valid:
+    st.error("Schema validation failed.")
+    for e in errors:
+        st.write(f"- {e}")
+    st.stop()
+
+for w in warning_list:
+    st.warning(w)
+
+# --------------------------
+# Sidebar filters
+# --------------------------
+with st.sidebar:
+    categories = ["All"] + sorted(df_clean["Category"].unique().tolist())
+    category = st.selectbox("1. Category", categories)
+
+    d1 = df_clean if category == "All" else df_clean[df_clean["Category"] == category]
+    subcategories = ["All"] + sorted(d1["Subcategory"].unique().tolist())
+    subcategory = st.selectbox("2. Subcategory", subcategories)
+
+    d2 = d1 if subcategory == "All" else d1[d1["Subcategory"] == subcategory]
+    brands = ["All"] + sorted(d2["Brand"].unique().tolist())
+    brand = st.selectbox("3. Brand", brands)
+
+    d3 = d2 if brand == "All" else d2[d2["Brand"] == brand]
+    products = sorted(d3["Product"].unique().tolist())
+    selected_products = st.multiselect("4. Product SKU(s)", products)
+
+    if selected_products:
+        final_df = d3[d3["Product"].isin(selected_products)].copy()
+        product_label = ", ".join(selected_products) if len(selected_products) <= 3 else f"{len(selected_products)} selected SKUs"
+    else:
+        final_df = d3.copy()
+        product_label = "All Products"
+
+    forecast_horizon = st.slider("Forecast horizon (weeks)", 1, 8, 4)
+
+    st.markdown("---")
+    st.caption(f"Source rows: {len(final_df):,}")
+    st.caption(f"Date range: {df_clean['date_key'].min().date()} → {df_clean['date_key'].max().date()}")
+
+if final_df.empty:
+    st.warning("No rows match the selected filters.")
+    st.stop()
+
+weekly = aggregate_weekly(final_df)
+
+if len(weekly) < 4:
+    st.error("At least 4 weekly observations are required for a short-term forecast.")
+    st.stop()
+
+# --------------------------
+# Forecast units and value separately
+# --------------------------
+unit_result = run_forecast(weekly["Sales_Units"].values, horizon=forecast_horizon)
+value_result = run_forecast(weekly["Sales_Value"].values, horizon=forecast_horizon)
+
+last_date = weekly["date_key"].max()
+future_dates = [last_date + timedelta(weeks=i) for i in range(1, forecast_horizon + 1)]
+
+forecast_table = pd.DataFrame(
+    {
+        "Week": future_dates,
+        "Forecast Units": unit_result["forecast"],
+        "Units Lower": unit_result["lower"],
+        "Units Upper": unit_result["upper"],
+        "Forecast Value": value_result["forecast"],
+        "Value Lower": value_result["lower"],
+        "Value Upper": value_result["upper"],
+    }
+)
+
+# --------------------------
+# Header / scope
+# --------------------------
+scope_label = f"{category} > {subcategory} > {brand} > {product_label}"
+st.markdown(f"### Forecast Scope\n**{scope_label}**")
+
+# --------------------------
+# KPIs
+# --------------------------
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Forecast Volume", f"{forecast_table['Forecast Units'].sum():,.0f}")
+col2.metric("Forecast Value", f"R {forecast_table['Forecast Value'].sum():,.0f}")
+col3.metric("Volume Champion", unit_result["champion"])
+col4.metric("Value Champion", value_result["champion"])
+
+col5, col6, col7, col8 = st.columns(4)
+col5.metric("History Used", f"{len(weekly)} weeks")
+col6.metric(
+    "Volume WMAPE",
+    f"{unit_result['scores'].iloc[0]['WMAPE %']:.1f}%" if not unit_result["scores"].empty else "N/A",
+)
+col7.metric(
+    "Value WMAPE",
+    f"{value_result['scores'].iloc[0]['WMAPE %']:.1f}%" if not value_result["scores"].empty else "N/A",
+)
+col8.metric("Latest Weekly Units", f"{weekly['Sales_Units'].iloc[-1]:,.0f}")
+
+# --------------------------
+# YoY comparison
+# --------------------------
+st.markdown("---")
+st.subheader("📅 Comparable Period vs Last Year")
+
+if len(weekly) >= 52:
     ly_units = []
     ly_value = []
 
-    for future_date in forecast_dates:
-
-        target_date = (
-            future_date
-            - timedelta(weeks=52)
-        )
-
-        if weekly.empty:
-            continue
-
-        distances = (
-            weekly["date_key"] - target_date
-        ).abs().dt.days
-
-        nearest_idx = distances.idxmin()
-
-        nearest_distance = (
-            distances.loc[nearest_idx]
-        )
-
-        # Accept only reasonably close weekly observations.
-        if nearest_distance <= 7:
-
-            ly_units.append(
-                weekly.loc[
-                    nearest_idx,
-                    "Sales Units"
-                ]
-            )
-
-            ly_value.append(
-                weekly.loc[
-                    nearest_idx,
-                    "Sales Value"
-                ]
-            )
-
-    if len(ly_units) < len(forecast_dates):
-        return result
-
-    ly_units_total = np.sum(
-        ly_units
-    )
-
-    ly_value_total = np.sum(
-        ly_value
-    )
-
-    forecast_units = result[
-        "forecast_units"
-    ]
-
-    forecast_value = result[
-        "forecast_value"
-    ]
-
-    unit_growth = (
-        (
-            forecast_units
-            / ly_units_total
-        ) - 1
-    ) * 100 if ly_units_total > 0 else np.nan
-
-    value_growth = (
-        (
-            forecast_value
-            / ly_value_total
-        ) - 1
-    ) * 100 if ly_value_total > 0 else np.nan
-
-    result.update(
-        {
-            "available": True,
-            "ly_units": ly_units_total,
-            "ly_value": ly_value_total,
-            "unit_growth": unit_growth,
-            "value_growth": value_growth,
-            "unit_change": (
-                forecast_units
-                - ly_units_total
-            ),
-            "value_change": (
-                forecast_value
-                - ly_value_total
-            )
-        }
-    )
-
-    return result
-
-
-# ============================================================
-# 13. COMMERCIAL DIAGNOSTICS
-# ============================================================
-
-def generate_diagnostics(
-    weekly,
-    yoy,
-    product_label
-):
-    """
-    Generate diagnostics from observed historical data.
-
-    Important:
-    This function does NOT invent elasticity or uplift.
-    """
-
-    diagnostics = []
-
-    if weekly.empty:
-        return diagnostics
-
-    latest = weekly.iloc[-1]
-
-    # --------------------------------------------------------
-    # Distribution diagnostic
-    # --------------------------------------------------------
-
-    if (
-        weekly["Numeric Distribution"]
-        .notna()
-        .sum() >= 4
-    ):
-
-        recent_dist = (
-            weekly["Numeric Distribution"]
-            .tail(4)
-            .mean()
-        )
-
-        prior_dist = (
-            weekly["Numeric Distribution"]
-            .tail(13)
-            .head(9)
-            .mean()
-        )
-
-        if (
-            not np.isnan(recent_dist)
-            and not np.isnan(prior_dist)
-        ):
-
-            dist_change = (
-                recent_dist
-                - prior_dist
-            )
-
-            if dist_change < -2:
-
-                diagnostics.append(
-                    {
-                        "type": "Distribution",
-                        "title": "Distribution is weakening",
-                        "detail": (
-                            f"Average numeric distribution over "
-                            f"the latest 4 weeks is "
-                            f"{recent_dist:.1f}%, compared with "
-                            f"{prior_dist:.1f}% over the earlier "
-                            f"comparison period. The change is "
-                            f"{dist_change:.1f} percentage points."
-                        )
-                    }
-                )
-
-            elif dist_change > 2:
-
-                diagnostics.append(
-                    {
-                        "type": "Distribution",
-                        "title": "Distribution is improving",
-                        "detail": (
-                            f"Average numeric distribution over "
-                            f"the latest 4 weeks is "
-                            f"{recent_dist:.1f}%, up "
-                            f"{dist_change:.1f} percentage points "
-                            f"versus the earlier period."
-                        )
-                    }
-                )
-
-    # --------------------------------------------------------
-    # Promotion diagnostic
-    # --------------------------------------------------------
-
-    if (
-        weekly["Promo Depth %"]
-        .notna()
-        .sum() >= 4
-    ):
-
-        recent_promo = (
-            weekly["Promo Depth %"]
-            .tail(4)
-            .mean()
-        )
-
-        previous_promo = (
-            weekly["Promo Depth %"]
-            .tail(13)
-            .head(9)
-            .mean()
-        )
-
-        if (
-            not np.isnan(recent_promo)
-            and not np.isnan(previous_promo)
-        ):
-
-            promo_change = (
-                recent_promo
-                - previous_promo
-            )
-
-            if promo_change > 2:
-
-                diagnostics.append(
-                    {
-                        "type": "Promotion",
-                        "title": "Promotion depth has increased",
-                        "detail": (
-                            f"Average promotional depth is "
-                            f"{recent_promo:.1f}% in the latest "
-                            f"4 weeks versus "
-                            f"{previous_promo:.1f}% in the "
-                            f"earlier comparison period."
-                        )
-                    }
-                )
-
-            elif promo_change < -2:
-
-                diagnostics.append(
-                    {
-                        "type": "Promotion",
-                        "title": "Promotion depth has decreased",
-                        "detail": (
-                            f"Average promotional depth is "
-                            f"{recent_promo:.1f}% in the latest "
-                            f"4 weeks versus "
-                            f"{previous_promo:.1f}% previously."
-                        )
-                    }
-                )
-
-    # --------------------------------------------------------
-    # Price diagnostic
-    # --------------------------------------------------------
-
-    if (
-        weekly["Effective RSP"]
-        .notna()
-        .sum() >= 6
-    ):
-
-        recent_price = (
-            weekly["Effective RSP"]
-            .tail(4)
-            .mean()
-        )
-
-        prior_price = (
-            weekly["Effective RSP"]
-            .tail(13)
-            .head(9)
-            .mean()
-        )
-
-        if (
-            prior_price > 0
-            and not np.isnan(recent_price)
-        ):
-
-            price_change = (
-                (
-                    recent_price
-                    / prior_price
-                ) - 1
-            ) * 100
-
-            if abs(price_change) >= 3:
-
-                diagnostics.append(
-                    {
-                        "type": "Price",
-                        "title": "Effective selling price has changed",
-                        "detail": (
-                            f"Average effective selling price "
-                            f"is R {recent_price:,.2f} in the "
-                            f"latest 4 weeks versus "
-                            f"R {prior_price:,.2f} previously, "
-                            f"a change of {price_change:+.1f}%."
-                        )
-                    }
-                )
-
-    # --------------------------------------------------------
-    # YoY diagnostic
-    # --------------------------------------------------------
-
-    if yoy["available"]:
-
-        if yoy["unit_growth"] < 0:
-
-            diagnostics.append(
-                {
-                    "type": "Forecast",
-                    "title": "Forecast volume is below last year",
-                    "detail": (
-                        f"The 4-week forecast is "
-                        f"{abs(yoy['unit_growth']):.1f}% below "
-                        f"the comparable period last year."
-                    )
-                }
-            )
-
-        else:
-
-            diagnostics.append(
-                {
-                    "type": "Forecast",
-                    "title": "Forecast volume is above last year",
-                    "detail": (
-                        f"The 4-week forecast is "
-                        f"{yoy['unit_growth']:.1f}% above "
-                        f"the comparable period last year."
-                    )
-                }
-            )
-
-    return diagnostics
-
-
-# ============================================================
-# 14. FORECAST ACCURACY DISPLAY
-# ============================================================
-
-def calculate_mape(errors):
-
-    if errors is None or len(errors) == 0:
-        return np.nan
-
-    return (
-        np.mean(
-            np.abs(errors)
-        ) * 100
-    )
-
-
-# ============================================================
-# 15. MAIN APP
-# ============================================================
-
-st.markdown(
-    """
-    <div class="main-header">
-        Unilever Demand & Diagnostic Forecasting System
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.header(
-    "📥 Data & Filters"
-)
-
-uploaded_file = st.sidebar.file_uploader(
-    "Upload Weekly Sales CSV",
-    type=["csv"]
-)
-
-
-# ============================================================
-# FILE PROCESSING
-# ============================================================
-
-if uploaded_file is None:
-
-    st.info(
-        "👈 Upload your Unilever sales CSV dataset "
-        "in the left sidebar to generate forecasts "
-        "and commercial diagnostics."
-    )
-
-    st.markdown(
-        """
-        ### Recommended data
-
-        The platform works best when the dataset contains:
-
-        - At least 52 weeks of history
-        - Ideally 52+ weeks for YoY and seasonality
-        - Category
-        - Subcategory
-        - Brand
-        - Product / SKU
-        - Date
-        - Sales Value
-        - Price
-        - Promotional Price
-        - Numeric Distribution
-
-        **Important:** The platform will not manufacture a
-        Last Year benchmark when actual comparable history
-        is unavailable.
-        """
-    )
-
-    st.stop()
-
-
-# ============================================================
-# READ CSV
-# ============================================================
-
-try:
-
-    raw_df = pd.read_csv(
-        uploaded_file
-    )
-
-except Exception as e:
-
-    st.error(
-        f"Unable to read the CSV file: {e}"
-    )
-
-    st.stop()
-
-
-# ============================================================
-# VALIDATE
-# ============================================================
-
-is_valid, errors, warnings, df_clean = (
-    validate_and_preprocess(
-        raw_df
-    )
-)
-
-
-if not is_valid:
-
-    st.error(
-        "❌ Schema Validation Errors"
-    )
-
-    for error in errors:
-
-        st.write(
-            f"- {error}"
-        )
-
-    st.stop()
-
-
-# ============================================================
-# WARNINGS
-# ============================================================
-
-for warning in warnings:
-
-    st.warning(
-        warning
-    )
-
-
-# ============================================================
-# DATA SUMMARY
-# ============================================================
-
-number_of_weeks = (
-    df_clean["date_key"]
-    .nunique()
-)
-
-min_date = (
-    df_clean["date_key"]
-    .min()
-)
-
-max_date = (
-    df_clean["date_key"]
-    .max()
-)
-
-st.sidebar.success(
-    f"✅ Dataset loaded: {number_of_weeks} periods"
-)
-
-st.sidebar.caption(
-    f"{min_date.date()} → {max_date.date()}"
-)
-
-st.sidebar.markdown("---")
-
-
-# ============================================================
-# CATEGORY FILTER
-# ============================================================
-
-categories = (
-    ["All"]
-    + sorted(
-        df_clean["Category"]
-        .unique()
-        .tolist()
-    )
-)
-
-selected_category = st.sidebar.selectbox(
-    "1. Category",
-    categories
-)
-
-
-df_category = df_clean.copy()
-
-if selected_category != "All":
-
-    df_category = df_category[
-        df_category["Category"]
-        == selected_category
-    ].copy()
-
-
-# ============================================================
-# SUBCATEGORY
-# ============================================================
-
-subcategories = (
-    ["All"]
-    + sorted(
-        df_category["Subcategory"]
-        .unique()
-        .tolist()
-    )
-)
-
-selected_subcategory = st.sidebar.selectbox(
-    "2. Subcategory",
-    subcategories
-)
-
-
-df_subcategory = df_category.copy()
-
-if selected_subcategory != "All":
-
-    df_subcategory = df_subcategory[
-        df_subcategory["Subcategory"]
-        == selected_subcategory
-    ].copy()
-
-
-# ============================================================
-# BRAND
-# ============================================================
-
-brands = (
-    ["All"]
-    + sorted(
-        df_subcategory["Brand"]
-        .unique()
-        .tolist()
-    )
-)
-
-selected_brand = st.sidebar.selectbox(
-    "3. Brand",
-    brands
-)
-
-
-df_brand = df_subcategory.copy()
-
-if selected_brand != "All":
-
-    df_brand = df_brand[
-        df_brand["Brand"]
-        == selected_brand
-    ].copy()
-
-
-# ============================================================
-# PRODUCT
-# ============================================================
-
-product_options = (
-    sorted(
-        df_brand["Product"]
-        .unique()
-        .tolist()
-    )
-)
-
-selected_products = st.sidebar.multiselect(
-    "4. Product SKU(s)",
-    options=product_options,
-    default=[]
-)
-
-
-if not selected_products:
-
-    final_df = df_brand.copy()
-
-    product_label = (
-        f"All Products in "
-        f"{selected_brand if selected_brand != 'All' else 'Portfolio'}"
-    )
-
-else:
-
-    final_df = df_brand[
-        df_brand["Product"]
-        .isin(selected_products)
-    ].copy()
-
-    if len(selected_products) == 1:
-
-        product_label = selected_products[0]
-
+    for fd in future_dates:
+        target = fd - timedelta(weeks=52)
+        distance = (weekly["date_key"] - target).abs().dt.days
+        idx = distance.idxmin()
+        if distance.loc[idx] <= 7:
+            ly_units.append(weekly.loc[idx, "Sales_Units"])
+            ly_value.append(weekly.loc[idx, "Sales_Value"])
+
+    if len(ly_units) == len(future_dates):
+        ly_units_total = float(np.sum(ly_units))
+        ly_value_total = float(np.sum(ly_value))
+        fc_units = float(forecast_table["Forecast Units"].sum())
+        fc_value = float(forecast_table["Forecast Value"].sum())
+
+        yoy1, yoy2, yoy3, yoy4 = st.columns(4)
+        yoy1.metric("Forecast Units", f"{fc_units:,.0f}")
+        yoy2.metric("LY Comparable Units", f"{ly_units_total:,.0f}")
+        yoy3.metric("Volume YoY", f"{((fc_units / ly_units_total) - 1) * 100:+.1f}%")
+        yoy4.metric("Value YoY", f"{((fc_value / ly_value_total) - 1) * 100:+.1f}%")
     else:
-
-        product_label = (
-            f"{len(selected_products)} Selected SKUs"
-        )
-
-
-# ============================================================
-# EMPTY DATA CHECK
-# ============================================================
-
-if final_df.empty:
-
-    st.warning(
-        "⚠️ No data matches the selected filter combination."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# SCOPE LABEL
-# ============================================================
-
-scope_label = (
-    f"{selected_category} > "
-    f"{selected_subcategory} > "
-    f"{selected_brand} > "
-    f"{product_label}"
-)
-
-
-# ============================================================
-# WEEKLY AGGREGATION
-# ============================================================
-
-df_weekly = aggregate_weekly(
-    final_df
-)
-
-
-if df_weekly.empty:
-
-    st.error(
-        "Unable to create weekly aggregated data."
-    )
-
-    st.stop()
-
-
-# ============================================================
-# FORECAST
-# ============================================================
-
-df_forecast, forecast_metadata = (
-    compute_forecast(
-        df_weekly,
-        periods=4
-    )
-)
-
-
-forecast_only = df_forecast[
-    df_forecast["Type"] == "Forecast"
-].copy()
-
-
-# ============================================================
-# FORECAST TOTALS
-# ============================================================
-
-forecast_4wk_units = (
-    forecast_only["Sales Units"]
-    .sum()
-)
-
-forecast_4wk_value = (
-    forecast_only["Sales Value"]
-    .sum()
-)
-
-forecast_p10_units = (
-    forecast_only["units_p10"]
-    .sum()
-)
-
-forecast_p90_units = (
-    forecast_only["units_p90"]
-    .sum()
-)
-
-forecast_p10_value = (
-    forecast_only["value_p10"]
-    .sum()
-)
-
-forecast_p90_value = (
-    forecast_only["value_p90"]
-    .sum()
-)
-
-
-# ============================================================
-# YOY
-# ============================================================
-
-yoy = calculate_yoy_comparison(
-    df_weekly,
-    forecast_only
-)
-
-
-# ============================================================
-# DIAGNOSTICS
-# ============================================================
-
-diagnostics = generate_diagnostics(
-    df_weekly,
-    yoy,
-    product_label
-)
-
-
-# ============================================================
-# CURRENT METRICS
-# ============================================================
-
-latest_week = df_weekly.iloc[-1]
-
-latest_distribution = (
-    latest_week["Numeric Distribution"]
-)
-
-latest_promo_depth = (
-    latest_week["Promo Depth %"]
-)
-
-latest_rsp = (
-    latest_week["Effective RSP"]
-)
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    f"""
-    ### Forecast Scope
-
-    **{scope_label}**
-    """
-)
-
-
-# ============================================================
-# DATA QUALITY STATUS
-# ============================================================
-
-if len(df_weekly) < 26:
-
-    st.markdown(
-        f"""
-        <div class="warning-card">
-        <strong>⚠️ Limited history</strong><br>
-        Only {len(df_weekly)} weekly observations are available.
-        Forecasts should be interpreted cautiously.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-elif len(df_weekly) < 52:
-
-    st.markdown(
-        """
-        <div class="info-box">
-        <strong>ℹ️ 26–51 weeks of history</strong><br>
-        The model can produce a short-term forecast, but
-        annual seasonality and actual same-period-last-year
-        comparisons are not yet available.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
+        st.info("52-week comparable dates could not be matched cleanly for every forecast week.")
 else:
-
-    st.markdown(
-        """
-        <div class="positive-card">
-        <strong>✓ Sufficient historical depth</strong><br>
-        The dataset contains at least 52 weeks, allowing
-        annual seasonality and comparable-period analysis.
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-
-# ============================================================
-# KPI DASHBOARD
-# ============================================================
-
-st.markdown(
-    "### 📊 Forecast Summary"
-)
-
-col1, col2, col3, col4 = st.columns(4)
-
-
-col1.metric(
-    "4-Wk Volume Forecast",
-    f"{forecast_4wk_units:,.0f}"
-)
-
-
-col2.metric(
-    "4-Wk Revenue Forecast",
-    f"R {forecast_4wk_value:,.0f}"
-)
-
-
-if yoy["available"]:
-
-    col3.metric(
-        "Forecast YoY Volume",
-        f"{yoy['unit_growth']:+.1f}%"
-    )
-
-    col4.metric(
-        "Forecast YoY Value",
-        f"{yoy['value_growth']:+.1f}%"
-    )
-
-else:
-
-    col3.metric(
-        "Forecast YoY Volume",
-        "N/A"
-    )
-
-    col4.metric(
-        "Forecast YoY Value",
-        "N/A"
-    )
-
-
-# ============================================================
-# SECOND KPI ROW
-# ============================================================
-
-col5, col6, col7, col8 = st.columns(4)
-
-
-if not np.isnan(latest_distribution):
-
-    col5.metric(
-        "Latest Distribution",
-        f"{latest_distribution:.1f}%"
-    )
-
-else:
-
-    col5.metric(
-        "Latest Distribution",
-        "N/A"
-    )
-
-
-if not np.isnan(latest_promo_depth):
-
-    col6.metric(
-        "Promo Depth",
-        f"{latest_promo_depth:.1f}%"
-    )
-
-else:
-
-    col6.metric(
-        "Promo Depth",
-        "N/A"
-    )
-
-
-if not np.isnan(latest_rsp):
-
-    col7.metric(
-        "Effective RSP",
-        f"R {latest_rsp:,.2f}"
-    )
-
-else:
-
-    col7.metric(
-        "Effective RSP",
-        "N/A"
-    )
-
-
-col8.metric(
-    "Historical Weeks",
-    f"{len(df_weekly):,}"
-)
-
-
-# ============================================================
-# YOY SECTION
-# ============================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 📅 Comparable Period Analysis"
-)
-
-
-if yoy["available"]:
-
-    yoy_col1, yoy_col2, yoy_col3, yoy_col4 = (
-        st.columns(4)
-    )
-
-    yoy_col1.metric(
-        "Forecast Units",
-        f"{yoy['forecast_units']:,.0f}"
-    )
-
-    yoy_col2.metric(
-        "LY Comparable Units",
-        f"{yoy['ly_units']:,.0f}"
-    )
-
-    yoy_col3.metric(
-        "Volume Change",
-        f"{yoy['unit_change']:+,.0f}"
-    )
-
-    yoy_col4.metric(
-        "Volume Growth",
-        f"{yoy['unit_growth']:+.1f}%"
-    )
-
-else:
-
     st.info(
-        "Actual same-period-last-year comparison is not "
-        "available because the selected scope does not "
-        "contain at least 52 weeks of usable history. "
-        "No artificial LY benchmark has been created."
+        f"Actual YoY is not calculated because this scope contains only {len(weekly)} weeks. "
+        "The platform will not manufacture a Last Year benchmark."
     )
 
-
-# ============================================================
-# FORECAST RANGE
-# ============================================================
-
+# --------------------------
+# Model performance
+# --------------------------
 st.markdown("---")
+st.subheader("🧠 Model Selection & Backtesting")
 
-st.markdown(
-    "### 📐 Forecast Range"
-)
+mcol1, mcol2 = st.columns(2)
 
-
-range_col1, range_col2 = st.columns(2)
-
-
-range_col1.metric(
-    "4-Wk Volume Lower Range",
-    f"{forecast_p10_units:,.0f}"
-)
-
-range_col1.metric(
-    "4-Wk Volume Upper Range",
-    f"{forecast_p90_units:,.0f}"
-)
-
-
-range_col2.metric(
-    "4-Wk Revenue Lower Range",
-    f"R {forecast_p10_value:,.0f}"
-)
-
-range_col2.metric(
-    "4-Wk Revenue Upper Range",
-    f"R {forecast_p90_value:,.0f}"
-)
-
-
-if (
-    forecast_metadata["unit_empirical_interval"]
-    and forecast_metadata["value_empirical_interval"]
-):
-
-    st.caption(
-        "Forecast ranges are based on empirical historical "
-        "back-test errors from the selected scope."
-    )
-
-else:
-
-    st.caption(
-        "Forecast ranges are indicative because there are "
-        "not enough historical observations to estimate "
-        "empirical forecast errors reliably."
-    )
-
-
-# ============================================================
-# COMMERCIAL DIAGNOSTICS
-# ============================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 🔎 Commercial Diagnostics"
-)
-
-
-if not diagnostics:
-
-    st.success(
-        "No major historical diagnostic signal was detected "
-        "from the available data."
-    )
-
-else:
-
-    for diagnostic in diagnostics:
-
-        st.markdown(
-            f"""
-            <div class="solution-box">
-                <strong>
-                    [{diagnostic['type']}] 
-                    {diagnostic['title']}
-                </strong>
-                <br>
-                <span style="color:#374151;font-size:14px;">
-                    {diagnostic['detail']}
-                </span>
-            </div>
-            """,
-            unsafe_allow_html=True
+with mcol1:
+    st.markdown("**Volume models**")
+    if unit_result["scores"].empty:
+        st.info("Not enough history for model comparison.")
+    else:
+        table = unit_result["scores"].copy()
+        table.insert(0, "Selected", table["Model"].eq(unit_result["champion"]))
+        st.dataframe(
+            table[["Selected", "Model", "WMAPE %", "sMAPE %", "Bias %", "Forecasts Tested"]].style.format(
+                {
+                    "WMAPE %": "{:.1f}%",
+                    "sMAPE %": "{:.1f}%",
+                    "Bias %": "{:+.1f}%",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
         )
 
-
-# ============================================================
-# PRESCRIPTIVE GUIDANCE
-# ============================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 💡 Commercial Action Framework"
-)
-
-
-st.info(
-    """
-    The system deliberately does not claim that a specific
-    discount, distribution increase or promotion will recover
-    a fixed number of units unless that relationship has been
-    statistically estimated from the underlying data.
-
-    Recommended commercial workflow:
-
-    **Identify → Quantify → Test → Measure**
-
-    1. Identify the driver.
-    2. Quantify the historical relationship.
-    3. Test the intervention.
-    4. Measure the resulting incremental volume/value.
-    """
-)
-
-
-# ============================================================
-# CHART
-# ============================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 📈 Historical vs 4-Week Forecast"
-)
+with mcol2:
+    st.markdown("**Value models**")
+    if value_result["scores"].empty:
+        st.info("Not enough history for model comparison.")
+    else:
+        table = value_result["scores"].copy()
+        table.insert(0, "Selected", table["Model"].eq(value_result["champion"]))
+        st.dataframe(
+            table[["Selected", "Model", "WMAPE %", "sMAPE %", "Bias %", "Forecasts Tested"]].style.format(
+                {
+                    "WMAPE %": "{:.1f}%",
+                    "sMAPE %": "{:.1f}%",
+                    "Bias %": "{:+.1f}%",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 st.caption(
-    f"Active Scope: {scope_label}"
+    f"Backtest method: rolling-origin validation with a {unit_result['bt_horizon']}-week horizon, "
+    f"minimum training history of {unit_result['min_train']} weeks, and {unit_result['n_origins']} validation origins. "
+    "The champion is selected by lowest WMAPE, with absolute bias used as the tie-breaker."
 )
 
+# --------------------------
+# Forecast detail
+# --------------------------
+st.markdown("---")
+st.subheader("🔮 Forecast Detail")
 
-metric_toggle = st.radio(
-    "Chart Metric",
-    [
-        "Sales Units (Volume)",
-        "Sales Value (Revenue R)"
-    ],
-    horizontal=True
+styled_forecast = forecast_table.copy()
+styled_forecast["Week"] = styled_forecast["Week"].dt.strftime("%Y-%m-%d")
+st.dataframe(
+    styled_forecast.style.format(
+        {
+            "Forecast Units": "{:,.0f}",
+            "Units Lower": "{:,.0f}",
+            "Units Upper": "{:,.0f}",
+            "Forecast Value": "R {:,.0f}",
+            "Value Lower": "R {:,.0f}",
+            "Value Upper": "R {:,.0f}",
+        }
+    ),
+    use_container_width=True,
+    hide_index=True,
 )
 
+st.caption(f"Volume interval: {unit_result['interval_method']}")
+st.caption(f"Value interval: {value_result['interval_method']}")
 
-if "Units" in metric_toggle:
+# --------------------------
+# Chart
+# --------------------------
+st.markdown("---")
+st.subheader("📈 Historical vs Forecast")
 
-    selected_col = "Sales Units"
-    lower_bound_col = "units_p10"
-    upper_bound_col = "units_p90"
-    y_title = "Sales Units"
-
-else:
-
-    selected_col = "Sales Value"
-    lower_bound_col = "value_p10"
-    upper_bound_col = "value_p90"
-    y_title = "Sales Value (R)"
-
-
-historical_plot = df_forecast[
-    df_forecast["Type"] == "Historical"
-].copy()
-
-
-forecast_plot = df_forecast[
-    df_forecast["Type"] == "Forecast"
-].copy()
-
-
-# ============================================================
-# PLOT
-# ============================================================
+metric = st.radio(
+    "Chart metric",
+    ["Volume (Units)", "Value (R)"],
+    horizontal=True,
+)
 
 fig = go.Figure()
 
-
-# ------------------------------------------------------------
-# Historical
-# ------------------------------------------------------------
+if metric.startswith("Volume"):
+    hist_y = weekly["Sales_Units"]
+    future_y = forecast_table["Forecast Units"]
+    lower_y = forecast_table["Units Lower"]
+    upper_y = forecast_table["Units Upper"]
+    y_title = "Units"
+else:
+    hist_y = weekly["Sales_Value"]
+    future_y = forecast_table["Forecast Value"]
+    lower_y = forecast_table["Value Lower"]
+    upper_y = forecast_table["Value Upper"]
+    y_title = "Sales Value (R)"
 
 fig.add_trace(
     go.Scatter(
-        x=historical_plot["date_key"],
-        y=historical_plot[selected_col],
+        x=weekly["date_key"],
+        y=hist_y,
         mode="lines+markers",
         name="Historical",
-        line=dict(
-            width=2.5
-        ),
-        marker=dict(
-            size=5
-        )
+        line=dict(width=2.5),
+        marker=dict(size=5),
     )
 )
 
-
-# ------------------------------------------------------------
-# Forecast
-# ------------------------------------------------------------
+# Add anchor so forecast visually connects to the last actual.
+anchor_x = [weekly["date_key"].iloc[-1]] + future_dates
+anchor_y = [hist_y.iloc[-1]] + list(future_y)
 
 fig.add_trace(
     go.Scatter(
-        x=forecast_plot["date_key"],
-        y=forecast_plot[selected_col],
+        x=anchor_x,
+        y=anchor_y,
         mode="lines+markers",
-        name="4-Week Forecast",
-        line=dict(
-            width=3,
-            dash="dash"
-        ),
-        marker=dict(
-            size=7,
-            symbol="diamond"
-        )
+        name=f"Forecast ({unit_result['champion'] if metric.startswith('Volume') else value_result['champion']})",
+        line=dict(width=3, dash="dash"),
+        marker=dict(size=7, symbol="diamond"),
     )
 )
 
-
-# ------------------------------------------------------------
-# Prediction range
-# ------------------------------------------------------------
-
 fig.add_trace(
     go.Scatter(
-        x=pd.concat(
-            [
-                forecast_plot["date_key"],
-                forecast_plot["date_key"].iloc[::-1]
-            ]
-        ),
-        y=pd.concat(
-            [
-                forecast_plot[upper_bound_col],
-                forecast_plot[lower_bound_col].iloc[::-1]
-            ]
-        ),
+        x=future_dates + future_dates[::-1],
+        y=list(upper_y) + list(lower_y[::-1]),
         fill="toself",
         fillcolor="rgba(30, 58, 138, 0.12)",
-        line=dict(
-            color="rgba(255,255,255,0)"
-        ),
+        line=dict(color="rgba(255,255,255,0)"),
         hoverinfo="skip",
         showlegend=True,
-        name="Forecast Range"
+        name="Empirical Forecast Range",
     )
 )
 
-
-# ------------------------------------------------------------
-# Last historical date
-# ------------------------------------------------------------
-
-if not historical_plot.empty:
-
-    last_hist_date = (
-        historical_plot["date_key"].iloc[-1]
-    )
-
-    fig.add_vline(
-        x=last_hist_date,
-        line_dash="dot",
-        line_width=1
-    )
-
+fig.add_vline(
+    x=weekly["date_key"].iloc[-1],
+    line_dash="dot",
+    line_width=1,
+)
 
 fig.update_layout(
     template="plotly_white",
     height=500,
     hovermode="x unified",
-    xaxis=dict(
-        title="Week"
-    ),
-    yaxis=dict(
-        title=y_title
-    ),
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.02,
-        xanchor="right",
-        x=1
-    )
+    xaxis_title="Week",
+    yaxis_title=y_title,
+    legend=dict(orientation="h", y=1.03, x=1, xanchor="right"),
 )
 
+st.plotly_chart(fig, use_container_width=True)
 
-st.plotly_chart(
-    fig,
-    use_container_width=True
-)
-
-
-# ============================================================
-# HISTORICAL DRIVER TABLE
-# ============================================================
-
+# --------------------------
+# Driver facts
+# --------------------------
 st.markdown("---")
+st.subheader("🔎 Recent Commercial Signals")
 
-st.markdown(
-    "### 📊 Recent Commercial Drivers"
-)
+signals = build_driver_summary(weekly)
+if signals:
+    for signal_type, text_value in signals:
+        st.markdown(
+            f'<div class="card"><strong>{signal_type}</strong><br>{text_value}</div>',
+            unsafe_allow_html=True,
+        )
+else:
+    st.info("Not enough observations to calculate recent driver comparisons.")
 
+# --------------------------
+# Recent history table
+# --------------------------
+st.markdown("---")
+st.subheader("📊 Recent Weekly History")
 
-driver_table = df_weekly.tail(
-    8
-).copy()
-
-
-driver_table = driver_table[
+recent = weekly.tail(8).copy()
+recent = recent[
     [
         "date_key",
-        "Sales Units",
-        "Sales Value",
-        "Effective RSP",
-        "Promo Depth %",
-        "Numeric Distribution"
+        "Sales_Units",
+        "Sales_Value",
+        "Effective_RSP",
+        "Promo_Depth_%",
+        "Distribution",
     ]
-].copy()
-
-
-driver_table.columns = [
+]
+recent.columns = [
     "Week",
     "Units",
     "Sales Value",
     "Effective RSP",
     "Promo Depth %",
-    "Numeric Distribution %"
+    "Numeric Distribution %",
 ]
-
-
-driver_table["Week"] = (
-    driver_table["Week"]
-    .dt.strftime("%Y-%m-%d")
-)
-
+recent["Week"] = recent["Week"].dt.strftime("%Y-%m-%d")
 
 st.dataframe(
-    driver_table,
-    use_container_width=True,
-    hide_index=True
-)
-
-
-# ============================================================
-# FORECAST TABLE
-# ============================================================
-
-st.markdown("---")
-
-st.markdown(
-    "### 🔮 4-Week Forecast Detail"
-)
-
-
-forecast_table = forecast_only[
-    [
-        "date_key",
-        "Sales Units",
-        "Sales Value",
-        "units_p10",
-        "units_p90",
-        "value_p10",
-        "value_p90"
-    ]
-].copy()
-
-
-forecast_table.columns = [
-    "Week",
-    "Forecast Units",
-    "Forecast Value",
-    "Units Lower",
-    "Units Upper",
-    "Value Lower",
-    "Value Upper"
-]
-
-
-forecast_table["Week"] = (
-    forecast_table["Week"]
-    .dt.strftime("%Y-%m-%d")
-)
-
-
-st.dataframe(
-    forecast_table.style.format(
+    recent.style.format(
         {
-            "Forecast Units": "{:,.0f}",
-            "Forecast Value": "R {:,.0f}",
-            "Units Lower": "{:,.0f}",
-            "Units Upper": "{:,.0f}",
-            "Value Lower": "R {:,.0f}",
-            "Value Upper": "R {:,.0f}"
+            "Units": "{:,.0f}",
+            "Sales Value": "R {:,.0f}",
+            "Effective RSP": "R {:,.2f}",
+            "Promo Depth %": "{:.1f}%",
+            "Numeric Distribution %": "{:.1f}%",
         }
     ),
     use_container_width=True,
-    hide_index=True
+    hide_index=True,
 )
 
+# --------------------------
+# Methodology
+# --------------------------
+with st.expander("ℹ️ Forecast Methodology"):
+    st.markdown(
+        f"""
+        **Volume champion:** {unit_result['champion']}  
+        **Value champion:** {value_result['champion']}  
 
-# ============================================================
-# FORECAST MODEL INFORMATION
-# ============================================================
+        **How the platform works**
 
-st.markdown("---")
+        1. The source is treated as weekly observations using `Full Date`.
+        2. Sales Units are calculated as Sales Value / Ave RSP without rounding at row level.
+        3. Candidate forecasting models are backtested using rolling historical cut-offs.
+        4. WMAPE is the primary model-selection metric because it is more robust than ordinary MAPE when demand is low or zero.
+        5. The best-performing model is refit using all available history and used for the future forecast.
+        6. Forecast ranges are estimated from historical forecast errors; no arbitrary ±12% band is hard-coded.
+        7. YoY is shown only when actual comparable history is present.
+        8. Price, promotion and distribution are shown as commercial diagnostics. They are not treated as causal drivers unless future driver assumptions are explicitly supplied and modelled.
 
-st.markdown(
-    "### 🧠 Forecast Model Information"
-)
-
-
-model_col1, model_col2, model_col3 = st.columns(3)
-
-
-model_col1.metric(
-    "History Used",
-    f"{len(df_weekly)} weeks"
-)
-
-
-unit_mape = calculate_mape(
-    forecast_metadata["unit_errors"]
-)
-
-value_mape = calculate_mape(
-    forecast_metadata["value_errors"]
-)
-
-
-if np.isnan(unit_mape):
-
-    model_col2.metric(
-        "Volume Backtest Error",
-        "N/A"
+        **Current source history:** {len(weekly)} weekly observations.
+        """
     )
 
-else:
-
-    model_col2.metric(
-        "Volume Backtest Error",
-        f"{unit_mape:.1f}%"
-    )
-
-
-if np.isnan(value_mape):
-
-    model_col3.metric(
-        "Value Backtest Error",
-        "N/A"
-    )
-
-else:
-
-    model_col3.metric(
-        "Value Backtest Error",
-        f"{value_mape:.1f}%"
-    )
-
-
-st.caption(
-    """
-    The forecasting engine combines a recent weighted
-    run-rate with a damped historical trend. Annual
-    seasonality is introduced only when sufficient
-    historical data is available. Forecast uncertainty is
-    estimated from rolling historical back-tests when enough
-    observations exist.
-    """
-)
-
-
-# ============================================================
-# DATA QUALITY DETAILS
-# ============================================================
-
-with st.expander(
-    "🔍 Data Quality Details"
-):
-
-    dq1, dq2, dq3, dq4 = st.columns(4)
-
-    dq1.metric(
-        "Rows",
-        f"{len(final_df):,}"
-    )
-
-    dq2.metric(
-        "SKUs",
-        f"{final_df['Product'].nunique():,}"
-    )
-
-    dq3.metric(
-        "Weeks",
-        f"{len(df_weekly):,}"
-    )
-
-    dq4.metric(
-        "Latest Date",
-        str(
-            df_weekly["date_key"].max().date()
-        )
-    )
-
-    st.write(
-        "Available columns:"
-    )
-
-    st.write(
-        list(final_df.columns)
-    )
+    if unit_result["fallback_reason"]:
+        st.warning(unit_result["fallback_reason"])
