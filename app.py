@@ -182,17 +182,17 @@ def validate_and_preprocess(df):
     # --------------------------------------------------------
 
     df_clean["Sales Value"] = pd.to_numeric(
-        df_clean["26 Weeks CY Value"],
+        df_clean["52 Weeks CY Value"],
         errors="coerce"
     )
 
     df_clean["Ave RSP"] = pd.to_numeric(
-        df_clean["26 Weeks CY Ave Price Quantity"],
+        df_clean["52 Weeks CY Ave Price Quantity"],
         errors="coerce"
     )
 
     df_clean["Promo RSP"] = pd.to_numeric(
-        df_clean["26 Weeks CY Ave RSP On Promo"],
+        df_clean["52 Weeks CY Ave RSP On Promo"],
         errors="coerce"
     )
 
@@ -331,7 +331,7 @@ def validate_and_preprocess(df):
 
         warnings.append(
             f"Only {number_of_dates} unique dates were found. "
-            "At least 26 weekly observations are recommended."
+            "At least 52 weekly observations are recommended."
         )
 
     # --------------------------------------------------------
@@ -1384,7 +1384,7 @@ if uploaded_file is None:
 
         The platform works best when the dataset contains:
 
-        - At least 26 weeks of history
+        - At least 52 weeks of history
         - Ideally 52+ weeks for YoY and seasonality
         - Category
         - Subcategory
