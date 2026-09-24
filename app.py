@@ -114,9 +114,9 @@ EXACT_REQUIRED_COLUMNS = [
     "Brand",
     "ProductsID",
     "Product",
-    "26 Weeks CY Value",
-    "26 Weeks CY Ave Price Quantity",
-    "26 Weeks CY Ave RSP On Promo"
+    "52 Weeks CY Value",
+    "52 Weeks CY Ave Price Quantity",
+    "52 Weeks CY Ave RSP On Promo"
 ]
 
 
