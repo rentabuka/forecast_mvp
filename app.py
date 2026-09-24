@@ -18,7 +18,7 @@ st.markdown("""
 <style>
     .main-header { font-size: 24px; font-weight: 700; color: #1E3A8A; margin-bottom: 20px; }
     
-    /* Reduced Font Size for Streamlit KPI Metrics */
+    /* Compact Font Styling for Streamlit KPI Metrics */
     [data-testid="stMetricValue"] {
         font-size: 18px !important;
         font-weight: 600 !important;
@@ -41,7 +41,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. SCHEMA VALIDATION & MAPPING
+# 2. SCHEMA VALIDATION & PREPROCESSING
 # ==========================================
 EXACT_REQUIRED_COLUMNS = [
     'Full Date', 'Category', 'Subcategory', 'Brand', 
@@ -89,7 +89,7 @@ def validate_and_preprocess(df):
 # ==========================================
 # 3. PRESCRIPTIVE RECOMMENDATION ENGINE
 # ==========================================
-def generate_prescriptive_actions(selection_label, brand, fcst_units, ly_units, fcst_val, ly_val, avg_rsp, promo_rsp, num_dist):
+def generate_prescriptive_actions(selection_label, brand_context, fcst_units, ly_units, fcst_val, ly_val, avg_rsp, promo_rsp, num_dist):
     """Generates commercial recommendations if forecast falls below last year."""
     unit_deficit = ly_units - fcst_units
     unit_deficit_pct = (unit_deficit / ly_units) * 100 if ly_units > 0 else 0
@@ -117,7 +117,7 @@ def generate_prescriptive_actions(selection_label, brand, fcst_units, ly_units, 
         })
         
     # 3. Rebrand Context (Shield / Rexona Shield)
-    if any(k in str(brand).lower() or k in str(selection_label).lower() for k in ["rexona", "shield"]):
+    if any(k in str(brand_context).lower() or k in str(selection_label).lower() for k in ["rexona", "shield"]):
         actions.append({
             "type": "Brand Conversion",
             "title": "Deploy Co-Branded 'Shield is now Rexona' In-Store POS",
@@ -173,11 +173,11 @@ def compute_forecast(df_aggregated):
     return pd.concat([df_hist, df_fcst], ignore_index=True)
 
 # ==========================================
-# 5. STREAMLIT APP LAYOUT
+# 5. STREAMLIT APP LAYOUT & FILTERS
 # ==========================================
 st.markdown("<div class='main-header'>Unilever Demand & Diagnostic Forecasting System</div>", unsafe_allow_html=True)
 
-st.sidebar.header("📥 Data Management")
+st.sidebar.header("📥 Data & Filters")
 uploaded_file = st.sidebar.file_uploader("Upload Weekly Sales CSV", type=["csv"])
 
 if uploaded_file is not None:
@@ -190,31 +190,57 @@ if uploaded_file is not None:
             st.write(f"- {err}")
     else:
         st.sidebar.success("✅ File Validated (26 Weeks Loaded)")
+        st.sidebar.markdown("---")
         
-        # Sidebar Selection Filters
-        brand_list = sorted(df_clean['Brand'].astype(str).unique().tolist())
-        selected_brand = st.sidebar.selectbox("Select Brand", brand_list)
+        # ----------------------------------------------------
+        # CASCADING FILTERS WITH "ALL" OPTION
+        # ----------------------------------------------------
         
-        # MULTI-SELECT PRODUCT FILTER
-        product_list = sorted(df_clean[df_clean['Brand'] == selected_brand]['Product'].astype(str).unique().tolist())
+        # 1. CATEGORY FILTER
+        categories = ["All"] + sorted(df_clean['Category'].astype(str).unique().tolist())
+        selected_category = st.sidebar.selectbox("1. Category", categories)
         
+        df_filtered_cat = df_clean.copy()
+        if selected_category != "All":
+            df_filtered_cat = df_filtered_cat[df_filtered_cat['Category'] == selected_category]
+            
+        # 2. SUBCATEGORY FILTER
+        subcategories = ["All"] + sorted(df_filtered_cat['Subcategory'].astype(str).unique().tolist())
+        selected_subcategory = st.sidebar.selectbox("2. Subcategory", subcategories)
+        
+        df_filtered_subcat = df_filtered_cat.copy()
+        if selected_subcategory != "All":
+            df_filtered_subcat = df_filtered_subcat[df_filtered_subcat['Subcategory'] == selected_subcategory]
+            
+        # 3. BRAND FILTER
+        brands = ["All"] + sorted(df_filtered_subcat['Brand'].astype(str).unique().tolist())
+        selected_brand = st.sidebar.selectbox("3. Brand", brands)
+        
+        df_filtered_brand = df_filtered_subcat.copy()
+        if selected_brand != "All":
+            df_filtered_brand = df_filtered_brand[df_filtered_brand['Brand'] == selected_brand]
+            
+        # 4. PRODUCT SKU MULTI-SELECT FILTER
+        product_options = ["All"] + sorted(df_filtered_brand['Product'].astype(str).unique().tolist())
         selected_products = st.sidebar.multiselect(
-            "Select Product SKU(s)", 
-            options=product_list,
-            default=product_list[:1] if product_list else []
+            "4. Product SKU(s)", 
+            options=product_options,
+            default=["All"]
         )
         
-        if not selected_products:
-            st.warning("⚠️ Please select at least one Product SKU from the sidebar multi-select dropdown.")
+        # Determine Final Filtered Dataset
+        if "All" in selected_products or not selected_products:
+            final_df = df_filtered_brand.copy()
+            product_label = f"All Products in {selected_brand if selected_brand != 'All' else 'Portfolio'}"
         else:
-            # Filter and aggregate data across all selected products
-            filtered_df = df_clean[
-                (df_clean['Brand'] == selected_brand) & 
-                (df_clean['Product'].isin(selected_products))
-            ].copy()
-            
-            # Group by weekly date_key to sum/average metrics across selected SKUs
-            df_aggregated = filtered_df.groupby('date_key').agg({
+            final_df = df_filtered_brand[df_filtered_brand['Product'].isin(selected_products)].copy()
+            product_label = selected_products[0] if len(selected_products) == 1 else f"{len(selected_products)} Selected SKUs"
+
+        if final_df.empty:
+            st.warning("⚠️ No data matches the selected filter combination.")
+        else:
+            # Group by weekly date_key to sum/average metrics across selected scope
+            df_aggregated = final_df.groupby('date_key').agg({
                 'Sales Value': 'sum',
                 'Sales Units': 'sum',
                 'Ave RSP': 'mean',
@@ -237,18 +263,18 @@ if uploaded_file is not None:
             latest_promo_rsp = df_aggregated['Promo RSP'].iloc[-1]
             latest_dist = df_aggregated['Numeric Distribution'].iloc[-1]
             
-            selection_label = selected_products[0] if len(selected_products) == 1 else f"{len(selected_products)} Selected SKUs ({selected_brand})"
+            scope_label = f"{selected_category} > {selected_subcategory} > {selected_brand} > {product_label}"
             
             # Run Prescriptive Diagnostics
             diagnostics = generate_prescriptive_actions(
-                selection_label, selected_brand, 
+                product_label, selected_brand, 
                 fcst_4wk_units, ly_same_period_units, 
                 fcst_4wk_value, ly_same_period_value,
                 latest_avg_rsp, latest_promo_rsp, latest_dist
             )
             
             # ----------------------------------------------------
-            # KPI METRICS DASHBOARD (REDUCED FONT SIZE)
+            # KPI METRICS DASHBOARD (COMPACT FONT SIZE)
             # ----------------------------------------------------
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("4-Wk Volume Forecast", f"{fcst_4wk_units:,.0f} units")
@@ -265,7 +291,7 @@ if uploaded_file is not None:
                 st.markdown(f"""
                 <div class='alert-card'>
                     <h4 style='margin:0; color:#991B1B;'>🚨 Forecast Deficit Detected: Volume is {diagnostics['unit_deficit_pct']:.1f}% Below Last Year</h4>
-                    <p style='margin-top:4px; margin-bottom:0; color:#7F1D1D; font-size:14px;'>Projected Revenue at Risk: <strong>R {diagnostics['revenue_at_risk']:,.2f}</strong> for <em>{selection_label}</em>.</p>
+                    <p style='margin-top:4px; margin-bottom:0; color:#7F1D1D; font-size:14px;'>Projected Revenue at Risk: <strong>R {diagnostics['revenue_at_risk']:,.2f}</strong> for scope: <em>{scope_label}</em>.</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -283,7 +309,8 @@ if uploaded_file is not None:
             # ----------------------------------------------------
             # PLOTLY CHART: 26 WEEKS HISTORICAL + 4 WEEKS FORECAST
             # ----------------------------------------------------
-            st.subheader(f"📈 26-Week Historical vs. 4-Week Forecast: {selection_label}")
+            st.subheader(f"📈 26-Week Historical vs. 4-Week Forecast")
+            st.caption(f"Active Filter Scope: **{scope_label}**")
             
             metric_toggle = st.radio(
                 "Select Chart View Metric:", 
