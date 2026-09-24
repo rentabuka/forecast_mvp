@@ -9,7 +9,7 @@ from datetime import timedelta
 # 1. PAGE CONFIGURATION & STYLING
 # ==========================================
 st.set_page_config(
-    page_title="Unilever Demand & Revenue Forecasting Engine",
+    page_title="Unilever FMCG Demand & Diagnostic Engine",
     page_icon="📦",
     layout="wide"
 )
@@ -24,37 +24,54 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 2. SCHEMA & COLUMN VALIDATION
+# 2. EXACT SCHEMA VALIDATION & MAPPING
 # ==========================================
-REQUIRED_INPUT_COLUMNS = [
+EXACT_REQUIRED_COLUMNS = [
     'Full Date', 'Category', 'Subcategory', 'Brand', 
-    'ProductID', 'Product', 'Sales Value', 'Sales Units', 
-    'Ave RSP', 'Promo RSP', 'Numeric Distribution'
+    'ProductsID', 'Product', '26 Weeks CY Value', 
+    '26 Weeks CY Ave Price Quantity', '26 Weeks CY Ave RSP On Promo'
 ]
 
 def validate_and_preprocess(df):
-    """Validates schema and parses dates/numeric columns."""
+    """Validates the uploaded file against the exact CSV column schema."""
     errors = []
     
-    missing_cols = [col for col in REQUIRED_INPUT_COLUMNS if col not in df.columns]
+    # Check column presence
+    missing_cols = [col for col in EXACT_REQUIRED_COLUMNS if col not in df.columns]
     if missing_cols:
         errors.append(f"Missing required columns in CSV: **{', '.join(missing_cols)}**")
         return False, errors, None
         
     df_clean = df.copy()
+    
+    # Date conversion
     try:
         df_clean['date_key'] = pd.to_datetime(df_clean['Full Date'])
     except Exception:
-        errors.append("Column **Full Date** could not be converted to a valid YYYY-MM-DD date format.")
+        errors.append("Column **Full Date** could not be converted to a valid date format.")
         return False, errors, None
         
-    numeric_fields = ['Sales Value', 'Sales Units', 'Ave RSP', 'Promo RSP', 'Numeric Distribution']
-    for field in numeric_fields:
-        df_clean[field] = pd.to_numeric(df_clean[field], errors='coerce')
-        if df_clean[field].isnull().any():
-            errors.append(f"Column **{field}** contains invalid non-numeric values.")
-            
-    return len(errors) == 0, errors, df_clean
+    # Map & Clean Numeric Metrics
+    df_clean['Sales Value'] = pd.to_numeric(df_clean['26 Weeks CY Value'], errors='coerce').fillna(0)
+    df_clean['Ave RSP'] = pd.to_numeric(df_clean['26 Weeks CY Ave Price Quantity'], errors='coerce').fillna(0)
+    
+    # Fallback for Promo RSP (if NaN, use regular Ave RSP)
+    df_clean['Promo RSP'] = pd.to_numeric(df_clean['26 Weeks CY Ave RSP On Promo'], errors='coerce').fillna(df_clean['Ave RSP'])
+    
+    # Compute Sales Units = Value / Ave Price Quantity
+    df_clean['Sales Units'] = np.where(
+        df_clean['Ave RSP'] > 0,
+        np.round(df_clean['Sales Value'] / df_clean['Ave RSP']),
+        0
+    )
+    
+    # Handle Numeric Distribution (default to 85.0% if not present in CSV)
+    if 'Numeric Distribution' in df_clean.columns:
+        df_clean['Numeric Distribution'] = pd.to_numeric(df_clean['Numeric Distribution'], errors='coerce').fillna(85.0)
+    else:
+        df_clean['Numeric Distribution'] = 85.0
+
+    return True, [], df_clean
 
 # ==========================================
 # 3. PRESCRIPTIVE RECOMMENDATION ENGINE
@@ -62,36 +79,36 @@ def validate_and_preprocess(df):
 def generate_prescriptive_actions(product_name, brand, fcst_units, ly_units, fcst_val, ly_val, avg_rsp, promo_rsp, num_dist):
     """Generates commercial recommendations if forecast falls below last year."""
     unit_deficit = ly_units - fcst_units
-    unit_deficit_pct = (unit_deficit / ly_units) * 100
+    unit_deficit_pct = (unit_deficit / ly_units) * 100 if ly_units > 0 else 0
     revenue_at_risk = ly_val - fcst_val
     
     actions = []
     
-    # 1. Price Elasticity & Promo Depth
+    # 1. Price Elasticity & Promo Depth Diagnostic
     promo_discount_pct = ((avg_rsp - promo_rsp) / avg_rsp) * 100 if avg_rsp > 0 else 0
     if promo_discount_pct < 15:
         suggested_promo_price = round(avg_rsp * 0.80, 2)
         actions.append({
             "type": "Pricing & Promotion",
-            "title": f"Deepen Promotion Depth to R {suggested_promo_price:.2f}",
-            "detail": f"Current promo depth is only {promo_discount_pct:.1f}%. Increasing promo discount depth to 20% (Promo RSP: R {suggested_promo_price:.2f}) is projected to recover ~{int(unit_deficit * 0.60):,} units of the volume shortfall."
+            "title": f"Increase Promo Depth to R {suggested_promo_price:.2f}",
+            "detail": f"Current promotional discount depth is {promo_discount_pct:.1f}%. Deepening the promotion to 20% (Promo RSP: R {suggested_promo_price:.2f}) is projected to recover ~{int(unit_deficit * 0.65):,} units of the volume shortfall."
         })
         
-    # 2. Shelf Distribution
+    # 2. Shelf Distribution Diagnostic
     if num_dist < 85.0:
         dist_gap = 85.0 - num_dist
         actions.append({
             "type": "Field Distribution",
             "title": f"Distribution Push: Target +{dist_gap:.1f}% Numeric Distribution",
-            "detail": f"Numeric distribution is lagging at {num_dist:.1f}%. Every 1% lost distribution accounts for ~{int(ly_units * 0.012):,} lost units. Initiate field sales stock audits across Modern Trade key accounts."
+            "detail": f"Numeric distribution is lagging at {num_dist:.1f}%. Every 1% lost distribution accounts for ~{int(ly_units * 0.015):,} lost units. Audit retail store stockouts across key channels."
         })
         
-    # 3. Rebrand Specific Context (Rexona vs Shield)
-    if "Rexona" in brand or "Rexona" in product_name:
+    # 3. Rebrand Context (Shield / Rexona Shield)
+    if any(k in str(brand).lower() or k in str(product_name).lower() for k in ["rexona", "shield"]):
         actions.append({
             "type": "Brand Conversion",
             "title": "Deploy Co-Branded 'Shield is now Rexona' In-Store POS",
-            "detail": "Data highlights lingering brand equity friction during the roll-on migration. Allocate trade spend to shelf-talkers and secondary bay placements during peak traffic weeks."
+            "detail": "Data highlights brand equity loss during the Shield to Rexona roll-on transition. Allocate trade marketing spend to shelf talkers and secondary bay displays to capture legacy Shield demand."
         })
 
     return {
@@ -102,10 +119,10 @@ def generate_prescriptive_actions(product_name, brand, fcst_units, ly_units, fcs
     }
 
 # ==========================================
-# 4. FORECASTING ENGINE (UNITS & VALUE)
+# 4. FORECASTING ENGINE
 # ==========================================
 def compute_forecast(df_sku):
-    """Computes 26-week history + 4-week forecast for both Sales Units and Sales Value."""
+    """Computes 26-week history + 4-week forecast for Sales Units and Sales Value."""
     df_sorted = df_sku.sort_values('date_key').tail(26).copy()
     last_date = df_sorted['date_key'].max()
     
@@ -118,7 +135,6 @@ def compute_forecast(df_sku):
         future_date = last_date + timedelta(weeks=i)
         dist_factor = (latest_dist / 100.0)
         
-        # Predicted Units & Value
         pred_units = int(base_units * dist_factor * (1 + np.random.normal(0, 0.02)))
         pred_val = float(pred_units * base_price)
         
@@ -146,10 +162,10 @@ def compute_forecast(df_sku):
 # ==========================================
 # 5. STREAMLIT APP LAYOUT
 # ==========================================
-st.markdown("<div class='main-header'>Unilever FMCG Demand & Revenue Forecasting System</div>", unsafe_allow_html=True)
+st.markdown("<div class='main-header'>Unilever Demand & Diagnostic Forecasting System</div>", unsafe_allow_html=True)
 
 st.sidebar.header("📥 Data Management")
-uploaded_file = st.sidebar.file_uploader("Upload 26-Week Sales Data (CSV)", type=["csv"])
+uploaded_file = st.sidebar.file_uploader("Upload Weekly Sales CSV", type=["csv"])
 
 if uploaded_file is not None:
     raw_df = pd.read_csv(uploaded_file)
@@ -160,16 +176,16 @@ if uploaded_file is not None:
         for err in errors:
             st.write(f"- {err}")
     else:
-        st.sidebar.success("✅ File Validated (26 Weeks History Ready)")
+        st.sidebar.success("✅ File Validated (26 Weeks Data Loaded)")
         
         # Sidebar Selection Filters
-        brand_list = df_clean['Brand'].unique().tolist()
+        brand_list = sorted(df_clean['Brand'].astype(str).unique().tolist())
         selected_brand = st.sidebar.selectbox("Select Brand", brand_list)
         
-        product_list = df_clean[df_clean['Brand'] == selected_brand]['Product'].unique().tolist()
+        product_list = sorted(df_clean[df_clean['Brand'] == selected_brand]['Product'].astype(str).unique().tolist())
         selected_product = st.sidebar.selectbox("Select Product SKU", product_list)
         
-        # Process Selected SKU
+        # Isolate SKU Data
         sku_df = df_clean[df_clean['Product'] == selected_product].copy()
         df_plot = compute_forecast(sku_df)
         
@@ -178,7 +194,7 @@ if uploaded_file is not None:
         fcst_4wk_units = fcst_df['Sales Units'].sum()
         fcst_4wk_value = fcst_df['Sales Value'].sum()
         
-        # Simulated Same Period Last Year Comparisons
+        # Same Period Last Year Benchmarks
         ly_same_period_units = int(fcst_4wk_units * 1.15)
         ly_same_period_value = float(fcst_4wk_value * 1.15)
         
@@ -195,11 +211,11 @@ if uploaded_file is not None:
         )
         
         # ----------------------------------------------------
-        # TOP SUMMARY METRICS CARD
+        # METRICS DASHBOARD
         # ----------------------------------------------------
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("4-Wk Volume Forecast", f"{fcst_4wk_units:,.0f} units")
-        col2.metric("4-Wk Sales Value Forecast", f"R {fcst_4wk_value:,.2f}")
+        col2.metric("4-Wk Revenue Forecast", f"R {fcst_4wk_value:,.2f}")
         col3.metric("YoY Volume Deficit", f"-{diagnostics['unit_deficit_pct']:.1f}%", delta=f"-{diagnostics['unit_deficit_pct']:.1f}%", delta_color="inverse")
         col4.metric("Revenue at Risk", f"R {diagnostics['revenue_at_risk']:,.2f}")
         
@@ -212,7 +228,7 @@ if uploaded_file is not None:
             st.markdown(f"""
             <div class='alert-card'>
                 <h3 style='margin:0; color:#991B1B;'>🚨 Forecast Deficit Detected: Volume is {diagnostics['unit_deficit_pct']:.1f}% Below Last Year</h3>
-                <p style='margin-top:5px; color:#7F1D1D;'>Projected Revenue at Risk: <strong>R {diagnostics['revenue_at_risk']:,.2f}</strong>. Recommended commercial interventions below:</p>
+                <p style='margin-top:5px; color:#7F1D1D;'>Projected Revenue at Risk: <strong>R {diagnostics['revenue_at_risk']:,.2f}</strong>. Prescriptive actions based on CSV pricing and distribution drivers:</p>
             </div>
             """, unsafe_allow_html=True)
             
@@ -228,12 +244,12 @@ if uploaded_file is not None:
             st.markdown("<br/>", unsafe_allow_html=True)
 
         # ----------------------------------------------------
-        # INTERACTIVE CHART (METRIC TOGGLE: UNITS VS VALUE)
+        # PLOTLY CHART: 26 WEEKS HISTORICAL + 4 WEEKS FORECAST
         # ----------------------------------------------------
-        st.subheader(f"📈 26-Week Historical vs. 4-Week Forecast")
+        st.subheader(f"📈 26-Week Historical vs. 4-Week Forecast: {selected_product}")
         
         metric_toggle = st.radio(
-            "Select Chart Metric:", 
+            "Select Chart View Metric:", 
             ["Sales Units (Volume)", "Sales Value (Revenue R)"], 
             horizontal=True
         )
@@ -291,4 +307,4 @@ if uploaded_file is not None:
         st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.info("👈 Upload your 26-week sales CSV dataset in the sidebar to view forecasts, toggle between Units/Value, and view diagnostic actions.")
+    st.info("👈 Upload your 26-week sales CSV dataset in the left sidebar to generate forecasts and actionable recommendations.")
