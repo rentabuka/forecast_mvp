@@ -13,12 +13,11 @@ st.set_page_config(
     layout="wide"
 )
 
-# Professional Unilever Branding & Reduced KPI Font CSS
+# Compact Font Styling for Streamlit KPI Metrics
 st.markdown("""
 <style>
     .main-header { font-size: 24px; font-weight: 700; color: #1E3A8A; margin-bottom: 20px; }
     
-    /* Compact Font Styling for Streamlit KPI Metrics */
     [data-testid="stMetricValue"] {
         font-size: 18px !important;
         font-weight: 600 !important;
@@ -132,24 +131,43 @@ def generate_prescriptive_actions(selection_label, brand_context, fcst_units, ly
     }
 
 # ==========================================
-# 4. FORECASTING ENGINE
+# 4. FIXED FORECASTING ENGINE
 # ==========================================
 def compute_forecast(df_aggregated):
-    """Computes 26-week history + 4-week forecast for Sales Units and Sales Value."""
+    """Computes 26-week history + 4-week forecast with direct run-rate scaling and smooth trace anchors."""
     df_sorted = df_aggregated.sort_values('date_key').tail(26).copy()
     last_date = df_sorted['date_key'].max()
     
+    # Base run-rates calculated directly on respective aggregated totals
     base_units = df_sorted['Sales Units'].tail(4).mean()
-    base_price = df_sorted['Ave RSP'].iloc[-1]
+    base_value = df_sorted['Sales Value'].tail(4).mean()
     latest_dist = df_sorted['Numeric Distribution'].iloc[-1]
     
+    # Last historical values for smooth trace connection
+    last_hist_units = df_sorted['Sales Units'].iloc[-1]
+    last_hist_value = df_sorted['Sales Value'].iloc[-1]
+    
     future_rows = []
+    
+    # Anchor point at the last historical date to connect the plot line
+    future_rows.append({
+        'date_key': last_date,
+        'Sales Units': last_hist_units,
+        'Sales Value': last_hist_value,
+        'units_p10': last_hist_units,
+        'units_p90': last_hist_units,
+        'value_p10': last_hist_value,
+        'value_p90': last_hist_value,
+        'Type': 'Forecast Anchor'
+    })
+    
     for i in range(1, 5):
         future_date = last_date + timedelta(weeks=i)
         dist_factor = (latest_dist / 100.0)
         
-        pred_units = int(base_units * dist_factor * (1 + np.random.normal(0, 0.02)))
-        pred_val = float(pred_units * base_price)
+        # Calculate volume and revenue predictions directly from historical baselines
+        pred_units = int(base_units * dist_factor * (1 + np.random.normal(0, 0.01)))
+        pred_val = float(base_value * dist_factor * (1 + np.random.normal(0, 0.01)))
         
         future_rows.append({
             'date_key': future_date,
@@ -191,10 +209,6 @@ if uploaded_file is not None:
     else:
         st.sidebar.success("✅ File Validated (26 Weeks Loaded)")
         st.sidebar.markdown("---")
-        
-        # ----------------------------------------------------
-        # CASCADING FILTERS WITH "ALL" OPTION
-        # ----------------------------------------------------
         
         # 1. CATEGORY FILTER
         categories = ["All"] + sorted(df_clean['Category'].astype(str).unique().tolist())
@@ -239,7 +253,7 @@ if uploaded_file is not None:
         if final_df.empty:
             st.warning("⚠️ No data matches the selected filter combination.")
         else:
-            # Group by weekly date_key to sum/average metrics across selected scope
+            # Group by weekly date_key to aggregate metrics across selected scope
             df_aggregated = final_df.groupby('date_key').agg({
                 'Sales Value': 'sum',
                 'Sales Units': 'sum',
@@ -250,7 +264,7 @@ if uploaded_file is not None:
             
             df_plot = compute_forecast(df_aggregated)
             
-            # Extract Forecast Summaries
+            # Extract Forecast Summaries (excluding anchor point for summary metrics)
             fcst_df = df_plot[df_plot['Type'] == 'Forecast']
             fcst_4wk_units = fcst_df['Sales Units'].sum()
             fcst_4wk_value = fcst_df['Sales Value'].sum()
@@ -274,7 +288,7 @@ if uploaded_file is not None:
             )
             
             # ----------------------------------------------------
-            # KPI METRICS DASHBOARD (COMPACT FONT SIZE)
+            # KPI METRICS DASHBOARD
             # ----------------------------------------------------
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("4-Wk Volume Forecast", f"{fcst_4wk_units:,.0f} units")
@@ -307,7 +321,7 @@ if uploaded_file is not None:
                 st.markdown("<br/>", unsafe_allow_html=True)
 
             # ----------------------------------------------------
-            # PLOTLY CHART: 26 WEEKS HISTORICAL + 4 WEEKS FORECAST
+            # PLOTLY CHART: CONTINUOUS HISTORICAL + FORECAST
             # ----------------------------------------------------
             st.subheader(f"📈 26-Week Historical vs. 4-Week Forecast")
             st.caption(f"Active Filter Scope: **{scope_label}**")
@@ -323,11 +337,12 @@ if uploaded_file is not None:
             upper_bound_col = 'units_p90' if "Units" in metric_toggle else 'value_p90'
             
             df_hist_plot = df_plot[df_plot['Type'] == 'Historical']
-            df_fcst_plot = df_plot[df_plot['Type'] == 'Forecast']
+            df_fcst_plot = df_plot[df_plot['Type'].str.contains('Forecast')]
+            df_bands_plot = df_plot[df_plot['Type'] == 'Forecast']
             
             fig = go.Figure()
 
-            # Historical Trace
+            # Historical Trace (Blue Line)
             fig.add_trace(go.Scatter(
                 x=df_hist_plot['date_key'],
                 y=df_hist_plot[selected_col],
@@ -337,7 +352,7 @@ if uploaded_file is not None:
                 marker=dict(size=5)
             ))
 
-            # Forecast Trace
+            # Forecast Trace (Green Line - Seamlessly Attached to Sep 13)
             fig.add_trace(go.Scatter(
                 x=df_fcst_plot['date_key'],
                 y=df_fcst_plot[selected_col],
@@ -347,10 +362,10 @@ if uploaded_file is not None:
                 marker=dict(size=7, symbol='diamond')
             ))
 
-            # Confidence Bounds
+            # Confidence Band (P10 - P90)
             fig.add_trace(go.Scatter(
-                x=pd.concat([df_fcst_plot['date_key'], df_fcst_plot['date_key'][::-1]]),
-                y=pd.concat([df_fcst_plot[upper_bound_col], df_fcst_plot[lower_bound_col][::-1]]),
+                x=pd.concat([df_bands_plot['date_key'], df_bands_plot['date_key'][::-1]]),
+                y=pd.concat([df_bands_plot[upper_bound_col], df_bands_plot[lower_bound_col][::-1]]),
                 fill='toself',
                 fillcolor='rgba(22, 163, 74, 0.15)',
                 line=dict(color='rgba(255,255,255,0)'),
