@@ -693,7 +693,7 @@ if diagnostics["unit_deficit_pct"] > 0:
 # ============================================================
 # 11. PLOTLY CHART: CONTINUOUS HISTORICAL + PROMO FORECAST
 # ============================================================
-st.subheader("📈 26-Week Historical vs. 4-Week Forecast (with 52-Week Promo Overlay)")
+st.subheader(f"📈 Historical vs. {forecast_horizon}-Week Forecast")
 
 metric_toggle = st.radio("Select Chart View Metric:", ["Volume (Units)", "Sales Value (Revenue R)"], horizontal=True)
 
@@ -722,7 +722,10 @@ if "Units" in metric_toggle:
     # Promo Overlay Forecast Line
     fig.add_trace(go.Scatter(
         x=anchor_x, y=anchor_y,
-        mode="lines+markers", name=f"Forecast (52-Wk Promo Overlay | {champion_model})",
+        mode="lines+markers", name=(
+            f"Forecast | {champion_model}"
+            + (" | 52-Wk Promo Overlay" if apply_promo_overlay else " | Actual-based")
+        ),
         line=dict(color="#059669", width=3, dash="dash"), marker=dict(size=7, symbol="diamond")
     ))
 
@@ -774,14 +777,53 @@ else:
 
     y_title = "Sales Value (R)"
 
+# Force every weekly observation to appear on the x-axis.
+all_chart_dates = list(weekly["date_key"]) + list(future_dates)
+all_chart_dates = pd.to_datetime(pd.Series(all_chart_dates)).drop_duplicates().sort_values().tolist()
+tick_text = [d.strftime("%d %b") for d in all_chart_dates]
+
+# Make the forecast boundary visually obvious.
+fig.add_vline(
+    x=weekly["date_key"].iloc[-1],
+    line_width=1,
+    line_dash="dot",
+    line_color="#64748B",
+)
+fig.add_annotation(
+    x=weekly["date_key"].iloc[-1],
+    y=1.02,
+    xref="x",
+    yref="paper",
+    text="Forecast starts →",
+    showarrow=False,
+    font=dict(size=11, color="#475569"),
+    xanchor="left",
+)
+
 fig.update_layout(
-    template="plotly_white", height=480, hovermode="x unified",
-    xaxis=dict(title="Week Start Date", showgrid=True),
+    template="plotly_white", height=560, hovermode="x unified",
+    margin=dict(l=60, r=30, t=90, b=115),
+    xaxis=dict(
+        title="Week Start Date",
+        showgrid=True,
+        tickmode="array",
+        tickvals=all_chart_dates,
+        ticktext=tick_text,
+        tickangle=-45,
+        automargin=True,
+    ),
     yaxis=dict(title=y_title, showgrid=True),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
+forecast_method_text = (
+    f"The forecast is based on **{forecast_source}** using **{champion_model}**. "
+    "The orange LY line is a comparison benchmark; it is not automatically added to the forecast. "
+    "The green planning range is a planning band, not a statistical confidence interval."
+)
+st.caption(forecast_method_text)
 
 
 # ============================================================
