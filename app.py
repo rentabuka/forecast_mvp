@@ -153,62 +153,94 @@ def validate_and_prepare(raw_df):
     )
     df["Sales Units"] = pd.to_numeric(df["Sales Units"], errors="coerce").fillna(0).clip(lower=0)
 
-    # Baseline & Incremental Processing (Foolproof Auto Scaler)
+    # Baseline & Incremental Processing
+    #
+    # The old logic guessed the baseline scale from broad ratio bands.
+    # That can accidentally interpret a value/annual field as weekly units,
+    # producing forecasts many times larger than actual demand.
     if measures["baseline"] is not None and measures["baseline"] in df.columns:
-        raw_b = clean_number(df[measures["baseline"]]).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
+        raw_b = (
+            clean_number(df[measures["baseline"]])
+            .replace([np.inf, -np.inf], np.nan)
+            .fillna(0)
+            .clip(lower=0)
+        )
 
-        mask = (df["Sales Units"] > 0) & (df["Sales Value"] > 0) & (df["Ave RSP"] > 0) & (raw_b > 0)
+        valid_mask = (
+            (df["Sales Units"] > 0)
+            & (df["Ave RSP"] > 0)
+            & (raw_b > 0)
+        )
 
-        if mask.any():
-            ratio_units = (raw_b[mask] / df.loc[mask, "Sales Units"]).median()
-            ratio_value = (raw_b[mask] / df.loc[mask, "Sales Value"]).median()
+        if valid_mask.any():
+            candidates = {
+                "weekly_units": raw_b,
+                "annual_units_div_52": raw_b / 52.0,
+                "weekly_value_to_units": raw_b / df["Ave RSP"],
+                "annual_value_div_52_to_units": raw_b / (52.0 * df["Ave RSP"]),
+            }
 
-            # Case A: Baseline is in Currency Rand Value -> convert to Units via / Ave RSP
-            if 0.2 <= ratio_value <= 3.0 and ratio_units > 2.0:
-                df["Baseline Units"] = np.where(df["Ave RSP"] > 0, raw_b / df["Ave RSP"], 0.0)
-                df["Baseline Value"] = raw_b
-                warnings_list.append("Source baseline field detected in Currency Rand Value; converted to Baseline Units via Ave RSP.")
-            # Case B: Baseline is already in Units
-            elif 0.2 <= ratio_units <= 3.0:
-                df["Baseline Units"] = raw_b
-                df["Baseline Value"] = raw_b * df["Ave RSP"]
-            # Case C: Baseline is 52-week cumulative annual volume -> divide by 52
-            elif 20.0 <= ratio_units <= 100.0 and ratio_value < 0.2:
-                df["Baseline Units"] = raw_b / 52.0
-                df["Baseline Value"] = df["Baseline Units"] * df["Ave RSP"]
-                warnings_list.append("Source baseline detected as 52-week cumulative volume; scaled to weekly units (/52).")
-            # Case D: Baseline is 52-week cumulative annual Rand value -> divide by (52 * Ave RSP)
-            elif 20.0 <= ratio_value <= 100.0:
-                df["Baseline Value"] = raw_b / 52.0
-                df["Baseline Units"] = np.where(df["Ave RSP"] > 0, df["Baseline Value"] / df["Ave RSP"], 0.0)
-                warnings_list.append("Source baseline detected as 52-week cumulative Rand value; scaled to weekly units (/52/RSP).")
+            candidate_stats = []
+            actual = df.loc[valid_mask, "Sales Units"].astype(float)
+            for mode, candidate in candidates.items():
+                test = pd.to_numeric(candidate.loc[valid_mask], errors="coerce")
+                ratio = (test / actual).replace([np.inf, -np.inf], np.nan).dropna()
+                ratio = ratio[ratio > 0]
+                if ratio.empty:
+                    continue
+                median_ratio = float(ratio.median())
+                score = abs(np.log(max(median_ratio, 1e-9)))
+                if median_ratio < 0.35 or median_ratio > 3.0:
+                    score += 2.0
+                candidate_stats.append((score, mode, median_ratio))
+
+            if candidate_stats:
+                _, chosen_mode, chosen_ratio = min(candidate_stats, key=lambda x: x[0])
+                baseline_units = candidates[chosen_mode]
+
+                if chosen_mode == "weekly_value_to_units":
+                    baseline_value = raw_b
+                elif chosen_mode == "annual_value_div_52_to_units":
+                    baseline_value = raw_b / 52.0
+                else:
+                    baseline_value = baseline_units * df["Ave RSP"]
+
+                df["Baseline Units"] = baseline_units
+                df["Baseline Value"] = baseline_value
+
+                mode_labels = {
+                    "weekly_units": "source treated as weekly units",
+                    "annual_units_div_52": "source treated as 52-week cumulative units and divided by 52",
+                    "weekly_value_to_units": "source treated as weekly Rand value and divided by RSP",
+                    "annual_value_div_52_to_units": "source treated as 52-week cumulative Rand value and divided by 52 and RSP",
+                }
+                warnings_list.append(
+                    f"Baseline scaling: {mode_labels[chosen_mode]}. "
+                    f"Median Baseline/Actual ratio = {chosen_ratio:.2f}x."
+                )
             else:
-                df["Baseline Units"] = np.where(df["Ave RSP"] > 0, raw_b / df["Ave RSP"], raw_b)
-                df["Baseline Value"] = raw_b
+                df["Baseline Units"] = df["Sales Units"]
+                df["Baseline Value"] = df["Sales Value"]
+                warnings_list.append("Baseline could not be reliably scaled; actual sales units are being used as the baseline.")
         else:
             df["Baseline Units"] = df["Sales Units"]
             df["Baseline Value"] = df["Sales Value"]
+            warnings_list.append("Baseline had no usable overlap with actual sales; actual sales units are being used as the baseline.")
 
         df["Baseline Units"] = pd.to_numeric(df["Baseline Units"], errors="coerce").fillna(0).clip(lower=0)
         df["Baseline Value"] = pd.to_numeric(df["Baseline Value"], errors="coerce").fillna(0).clip(lower=0)
 
-        calculated_incremental = df["Sales Units"] - df["Baseline Units"]
-        df["Calculated Incremental Units"] = calculated_incremental
+        df["Calculated Incremental Units"] = df["Sales Units"] - df["Baseline Units"]
 
         incremental_col = measures.get("incremental")
         if incremental_col and incremental_col in df.columns:
             raw_inc = clean_number(df[incremental_col]).replace([np.inf, -np.inf], np.nan)
-            inc_ratio = (raw_inc.abs().mean() / df["Sales Units"].mean()) if df["Sales Units"].mean() > 0 else 1.0
-            if 20.0 <= inc_ratio <= 100.0:
-                scaled_inc = raw_inc / 52.0
-            else:
-                scaled_inc = raw_inc
-
-            df["Source Incremental Units"] = scaled_inc
-            df["Incremental Units"] = df["Source Incremental Units"].fillna(calculated_incremental)
+            df["Source Incremental Units"] = raw_inc
+            # Always use the coherent weekly calculation for downstream aggregation.
+            df["Incremental Units"] = df["Calculated Incremental Units"]
         else:
             df["Source Incremental Units"] = np.nan
-            df["Incremental Units"] = calculated_incremental
+            df["Incremental Units"] = df["Calculated Incremental Units"]
     else:
         # Fallback for 26-week extracts missing explicit baseline columns
         df["Baseline Units"] = df["Sales Units"]
@@ -366,39 +398,72 @@ def run_baseline_model(series, horizon=4):
     return forecast_vals, best_model, best_wmape
 
 
+def choose_forecast_series(weekly):
+    """Use the baseline only when its scale is credible versus actual sales."""
+    actual = pd.to_numeric(weekly["Sales_Units"], errors="coerce").fillna(0)
+    baseline = pd.to_numeric(weekly["Baseline_Units"], errors="coerce").fillna(0)
+
+    mask = (actual > 0) & (baseline > 0)
+    if mask.sum() < 8:
+        return actual.values, "Actual Sales Units", np.nan
+
+    ratio = (baseline[mask] / actual[mask]).replace([np.inf, -np.inf], np.nan).dropna()
+    median_ratio = float(ratio.median()) if not ratio.empty else np.nan
+
+    if np.isfinite(median_ratio) and 0.40 <= median_ratio <= 3.00:
+        return baseline.values, "Baseline Units", median_ratio
+
+    return actual.values, "Actual Sales Units (baseline rejected)", median_ratio
+
+
 # ============================================================
 # 6. 52-WEEK PROMOTIONAL OVERLAY & SA MACRO ELASTICITY
 # ============================================================
-def apply_52wk_promo_overlay_and_sa_macro(weekly, future_dates, base_volume_fcst, price_yoy, cpi_inflation, elasticity):
+def apply_52wk_promo_overlay_and_sa_macro(
+    weekly,
+    future_dates,
+    base_volume_fcst,
+    price_yoy,
+    cpi_inflation,
+    elasticity,
+    apply_promo_overlay=True,
+):
     adjusted_fcst_units = []
     promo_lift_factors = []
     ly_benchmark_units = []
 
     net_price_squeeze = max(0.0, price_yoy - cpi_inflation)
-    macro_factor = max(0.5, 1.0 + (elasticity * (net_price_squeeze / 100.0)))
+    macro_factor = float(np.clip(1.0 + (elasticity * (net_price_squeeze / 100.0)), 0.5, 1.5))
 
     for idx, f_date in enumerate(future_dates):
         target_ly_date = f_date - timedelta(weeks=52)
         dist = (weekly["date_key"] - target_ly_date).abs().dt.days
         closest_idx = dist.idxmin()
 
+        lift_factor = 1.0
         if dist.loc[closest_idx] <= 7:
             ly_act_units = float(weekly.loc[closest_idx, "Sales_Units"])
             ly_base_units = float(weekly.loc[closest_idx, "Baseline_Units"])
-            
-            lift_factor = (ly_act_units / ly_base_units) if ly_base_units > 0 else 1.0
-            lift_factor = max(1.0, lift_factor)
-            
+
+            raw_lift = (ly_act_units / ly_base_units) if ly_base_units > 0 else 1.0
+            # Only use a historical promo lift when the baseline is plausible.
+            if apply_promo_overlay and 0.50 <= raw_lift <= 3.00:
+                lift_factor = max(1.0, raw_lift)
             ly_benchmark_units.append(ly_act_units)
-            promo_lift_factors.append(lift_factor)
-            
-            effective_lift = 1.0 + ((lift_factor - 1.0) * macro_factor)
-            adj_units = base_volume_fcst[idx] * effective_lift
-            adjusted_fcst_units.append(adj_units)
         else:
-            ly_benchmark_units.append(base_volume_fcst[idx])
-            promo_lift_factors.append(1.0)
-            adjusted_fcst_units.append(base_volume_fcst[idx])
+            ly_benchmark_units.append(np.nan)
+
+        promo_lift_factors.append(lift_factor)
+
+        # Apply macro price elasticity to base demand. Add promo lift only when
+        # forecasting from a validated baseline; otherwise historical promotion
+        # is already embedded in the actual-sales forecast and must not be doubled.
+        adj_units = base_volume_fcst[idx] * macro_factor
+        if apply_promo_overlay:
+            effective_lift = 1.0 + ((lift_factor - 1.0) * macro_factor)
+            adj_units *= effective_lift
+
+        adjusted_fcst_units.append(max(0.0, float(adj_units)))
 
     return np.array(adjusted_fcst_units), promo_lift_factors, ly_benchmark_units, macro_factor
 
@@ -536,13 +601,36 @@ if len(weekly) < 4:
 last_date = weekly["date_key"].max()
 future_dates = [last_date + timedelta(weeks=i) for i in range(1, forecast_horizon + 1)]
 
-# Base Unconstrained Forecasts
-base_volume_fcst, champion_model, model_wmape = run_baseline_model(weekly["Baseline_Units"].values, forecast_horizon)
-base_value_fcst, val_model, val_wmape = run_baseline_model(weekly["Baseline_Value"].values, forecast_horizon)
+# Base demand forecast
+forecast_series, forecast_source, baseline_ratio = choose_forecast_series(weekly)
+if forecast_source != "Baseline Units":
+    if np.isfinite(baseline_ratio):
+        st.sidebar.warning(
+            f"Baseline rejected for forecasting: median Baseline/Actual ratio = {baseline_ratio:.2f}x. "
+            "Forecasting actual sales units instead."
+        )
+    else:
+        st.sidebar.warning(
+            "Baseline rejected for forecasting: insufficient valid overlap. "
+            "Forecasting actual sales units instead."
+        )
+
+base_volume_fcst, champion_model, model_wmape = run_baseline_model(
+    forecast_series, forecast_horizon
+)
 
 # 52-Week Promotional Overlay + SA Macro Elasticity Adjustment
+# Do not stack a promo lift on top of an actual-sales forecast because that
+# would count historical promotion twice.
+apply_promo_overlay = forecast_source == "Baseline Units"
 final_volume_fcst, promo_lifts, ly_benchmark_units, macro_factor = apply_52wk_promo_overlay_and_sa_macro(
-    weekly, future_dates, base_volume_fcst, price_yoy, cpi_inflation, elasticity
+    weekly,
+    future_dates,
+    base_volume_fcst,
+    price_yoy,
+    cpi_inflation,
+    elasticity,
+    apply_promo_overlay=apply_promo_overlay,
 )
 
 avg_rsp_latest = weekly["Effective_RSP"].iloc[-1] if weekly["Effective_RSP"].iloc[-1] > 0 else 25.0
@@ -619,12 +707,13 @@ if "Units" in metric_toggle:
         line=dict(color="#7C3AED", width=2.5), marker=dict(size=5)
     ))
 
-    # Historical Baseline Units
-    fig.add_trace(go.Scatter(
-        x=weekly["date_key"], y=weekly["Baseline_Units"],
-        mode="lines+markers", name="Baseline Units",
-        line=dict(color="#EA580C", width=2, dash="dot"), marker=dict(size=4)
-    ))
+    # Historical Baseline Units - hide a rejected/invalid baseline from the main chart.
+    if forecast_source == "Baseline Units":
+        fig.add_trace(go.Scatter(
+            x=weekly["date_key"], y=weekly["Baseline_Units"],
+            mode="lines+markers", name="Baseline Units",
+            line=dict(color="#EA580C", width=2, dash="dot"), marker=dict(size=4)
+        ))
 
     # Seamless Anchor Point
     anchor_x = [weekly["date_key"].iloc[-1]] + future_dates
@@ -651,7 +740,7 @@ if "Units" in metric_toggle:
         y=upper_bound + lower_bound[::-1],
         fill="toself", fillcolor="rgba(5, 150, 105, 0.12)",
         line=dict(color="rgba(255,255,255,0)"), hoverinfo="skip",
-        showlegend=True, name="80% Confidence Range"
+        showlegend=True, name="Planning Range (±12%)"
     ))
 
     y_title = "Units"
@@ -680,7 +769,7 @@ else:
         y=upper_bound_val + lower_bound_val[::-1],
         fill="toself", fillcolor="rgba(5, 150, 105, 0.12)",
         line=dict(color="rgba(255,255,255,0)"), hoverinfo="skip",
-        showlegend=True, name="80% Confidence Range"
+        showlegend=True, name="Planning Range (±12%)"
     ))
 
     y_title = "Sales Value (R)"
@@ -703,7 +792,7 @@ st.subheader("🔮 Forecast Detail Table")
 
 table_df = pd.DataFrame({
     "Week": [d.strftime("%Y-%m-%d") for d in future_dates],
-    "Unconstrained Baseline Units": base_volume_fcst,
+    "Base Forecast Units": base_volume_fcst,
     "52-Wk Promo Lift Factor": [f"{l:.2f}x" for l in promo_lifts],
     "Selected Forecast Units": final_volume_fcst,
     "Forecast Revenue": final_value_fcst,
@@ -712,7 +801,7 @@ table_df = pd.DataFrame({
 
 st.dataframe(
     table_df.style.format({
-        "Unconstrained Baseline Units": "{:,.0f}",
+        "Base Forecast Units": "{:,.0f}",
         "Selected Forecast Units": "{:,.0f}",
         "Forecast Revenue": "R {:,.2f}",
         "Same Week LY Units": "{:,.0f}",
@@ -720,4 +809,9 @@ st.dataframe(
     use_container_width=True, hide_index=True
 )
 
-st.caption(f"Baseline Engine: **{champion_model}** | SA Macro Factor: **{macro_factor:.4f}** (Net Price Squeeze: {max(0, price_yoy - cpi_inflation):.1f}%)")
+st.caption(
+    f"Forecast Input: **{forecast_source}** | Model: **{champion_model}** "
+    f"| Backtest WMAPE: **{model_wmape:.1f}%** "
+    f"| SA Macro Factor: **{macro_factor:.4f}** "
+    f"(Net Price Squeeze: {max(0, price_yoy - cpi_inflation):.1f}%)"
+)
