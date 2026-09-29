@@ -80,7 +80,7 @@ BASE_COLUMNS = [
 
 
 # ============================================================
-# 3. PREPROCESSING & SMART CUMULATIVE AUTO-SCALE ENGINE
+# 3. PREPROCESSING & FOOLPROOF SCALE ENFORCEMENT ENGINE
 # ============================================================
 def clean_number(series):
     return pd.to_numeric(series, errors="coerce")
@@ -153,39 +153,41 @@ def validate_and_prepare(raw_df):
     )
     df["Sales Units"] = pd.to_numeric(df["Sales Units"], errors="coerce").fillna(0).clip(lower=0)
 
-    # Baseline & Incremental Processing (Smart Cumulative-to-Weekly Auto Scaler)
+    # Baseline & Incremental Processing (Foolproof Auto Scaler)
     if measures["baseline"] is not None and measures["baseline"] in df.columns:
-        raw_baseline = clean_number(df[measures["baseline"]]).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
+        raw_b = clean_number(df[measures["baseline"]]).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
 
-        mean_sales_units = df["Sales Units"].mean()
-        mean_sales_val = df["Sales Value"].mean()
-        mean_raw_b = raw_baseline.mean()
+        mask = (df["Sales Units"] > 0) & (df["Sales Value"] > 0) & (df["Ave RSP"] > 0) & (raw_b > 0)
 
-        if mean_sales_units > 0:
-            vol_ratio = mean_raw_b / mean_sales_units
-            val_ratio = mean_raw_b / mean_sales_val if mean_sales_val > 0 else 0
+        if mask.any():
+            ratio_units = (raw_b[mask] / df.loc[mask, "Sales Units"]).median()
+            ratio_value = (raw_b[mask] / df.loc[mask, "Sales Value"]).median()
 
-            # Case 1: 52-week annual cumulative volume in units -> divide by 52
-            if 20.0 <= vol_ratio <= 100.0:
-                df["Baseline Units"] = raw_baseline / 52.0
+            # Case A: Baseline is in Currency Rand Value -> convert to Units via / Ave RSP
+            if 0.2 <= ratio_value <= 3.0 and ratio_units > 2.0:
+                df["Baseline Units"] = np.where(df["Ave RSP"] > 0, raw_b / df["Ave RSP"], 0.0)
+                df["Baseline Value"] = raw_b
+                warnings_list.append("Source baseline field detected in Currency Rand Value; converted to Baseline Units via Ave RSP.")
+            # Case B: Baseline is already in Units
+            elif 0.2 <= ratio_units <= 3.0:
+                df["Baseline Units"] = raw_b
+                df["Baseline Value"] = raw_b * df["Ave RSP"]
+            # Case C: Baseline is 52-week cumulative annual volume -> divide by 52
+            elif 20.0 <= ratio_units <= 100.0 and ratio_value < 0.2:
+                df["Baseline Units"] = raw_b / 52.0
                 df["Baseline Value"] = df["Baseline Units"] * df["Ave RSP"]
-                warnings_list.append("Baseline detected as 52-week cumulative annual volume; scaled to weekly units (/52).")
-            # Case 2: 52-week annual cumulative value in Rand -> divide by (52 * Ave RSP)
-            elif 20.0 <= val_ratio <= 100.0:
-                df["Baseline Value"] = raw_baseline / 52.0
+                warnings_list.append("Source baseline detected as 52-week cumulative volume; scaled to weekly units (/52).")
+            # Case D: Baseline is 52-week cumulative annual Rand value -> divide by (52 * Ave RSP)
+            elif 20.0 <= ratio_value <= 100.0:
+                df["Baseline Value"] = raw_b / 52.0
                 df["Baseline Units"] = np.where(df["Ave RSP"] > 0, df["Baseline Value"] / df["Ave RSP"], 0.0)
-                warnings_list.append("Baseline detected as 52-week cumulative annual Rand value; scaled to weekly units (/52/RSP).")
-            # Case 3: 1-week value in Rand -> divide by Ave RSP
-            elif 0.5 <= val_ratio <= 2.0:
-                df["Baseline Value"] = raw_baseline
-                df["Baseline Units"] = np.where(df["Ave RSP"] > 0, raw_baseline / df["Ave RSP"], 0.0)
-            # Case 4: 1-week volume in units -> use as-is
+                warnings_list.append("Source baseline detected as 52-week cumulative Rand value; scaled to weekly units (/52/RSP).")
             else:
-                df["Baseline Units"] = raw_baseline
-                df["Baseline Value"] = raw_baseline * df["Ave RSP"]
+                df["Baseline Units"] = np.where(df["Ave RSP"] > 0, raw_b / df["Ave RSP"], raw_b)
+                df["Baseline Value"] = raw_b
         else:
-            df["Baseline Units"] = raw_baseline
-            df["Baseline Value"] = raw_baseline * df["Ave RSP"]
+            df["Baseline Units"] = df["Sales Units"]
+            df["Baseline Value"] = df["Sales Value"]
 
         df["Baseline Units"] = pd.to_numeric(df["Baseline Units"], errors="coerce").fillna(0).clip(lower=0)
         df["Baseline Value"] = pd.to_numeric(df["Baseline Value"], errors="coerce").fillna(0).clip(lower=0)
@@ -196,7 +198,7 @@ def validate_and_prepare(raw_df):
         incremental_col = measures.get("incremental")
         if incremental_col and incremental_col in df.columns:
             raw_inc = clean_number(df[incremental_col]).replace([np.inf, -np.inf], np.nan)
-            inc_ratio = raw_inc.abs().mean() / mean_sales_units if mean_sales_units > 0 else 1.0
+            inc_ratio = (raw_inc.abs().mean() / df["Sales Units"].mean()) if df["Sales Units"].mean() > 0 else 1.0
             if 20.0 <= inc_ratio <= 100.0:
                 scaled_inc = raw_inc / 52.0
             else:
