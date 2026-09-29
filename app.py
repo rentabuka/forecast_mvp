@@ -11,7 +11,7 @@ from statsmodels.tsa.holtwinters import Holt, SimpleExpSmoothing
 
 
 # ============================================================
-# 1. PAGE CONFIGURATION & COMPACT STYLING
+# 1. PAGE CONFIGURATION & STYLING
 # ============================================================
 st.set_page_config(
     page_title="Unilever FMCG Demand & Prescriptive Engine",
@@ -43,7 +43,6 @@ st.markdown(
 
     .alert-card {padding: 16px; border: 1px solid #FCA5A5; border-radius: 8px; background: #FEF2F2; margin-bottom: 16px;}
     .solution-box {background-color: #F0FDF4; border-left: 4px solid #16A34A; padding: 12px 16px; margin-top: 8px; border-radius: 4px;}
-    .card {padding: 14px 16px; border: 1px solid #E2E8F0; border-radius: 8px; background: #F8FAFC;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -81,7 +80,7 @@ BASE_COLUMNS = [
 
 
 # ============================================================
-# 3. DATA PREPROCESSING & AUTO-SCALE ENGINE
+# 3. PREPROCESSING & STRICT SCALE ENFORCEMENT
 # ============================================================
 def clean_number(series):
     return pd.to_numeric(series, errors="coerce")
@@ -154,21 +153,24 @@ def validate_and_prepare(raw_df):
     )
     df["Sales Units"] = pd.to_numeric(df["Sales Units"], errors="coerce").fillna(0).clip(lower=0)
 
-    # Baseline & Incremental Processing (Auto Scale Fix)
-    if measures["baseline"] is not None:
+    # Baseline & Incremental Processing (Strict Scale Fix)
+    if measures["baseline"] is not None and measures["baseline"] in df.columns:
         raw_baseline = clean_number(df[measures["baseline"]]).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
 
         val_mean = df["Sales Value"].mean()
         units_mean = df["Sales Units"].mean()
 
-        # Scale Auto-Detection: Check if Baseline is in Rand Value or Units
+        # Scale Auto-Detection: Check if Baseline is in Currency Value or Units
         if units_mean > 0 and val_mean > 0 and abs(raw_baseline.mean() - val_mean) < abs(raw_baseline.mean() - units_mean):
             df["Baseline Units"] = np.where(df["Ave RSP"] > 0, raw_baseline / df["Ave RSP"], 0)
+            df["Baseline Value"] = raw_baseline
             warnings_list.append("Source baseline field detected in Currency Rand; automatically converted to Baseline Units via Ave RSP.")
         else:
             df["Baseline Units"] = raw_baseline
+            df["Baseline Value"] = raw_baseline * df["Ave RSP"]
 
         df["Baseline Units"] = pd.to_numeric(df["Baseline Units"], errors="coerce").fillna(0).clip(lower=0)
+        df["Baseline Value"] = pd.to_numeric(df["Baseline Value"], errors="coerce").fillna(0).clip(lower=0)
 
         calculated_incremental = df["Sales Units"] - df["Baseline Units"]
         df["Calculated Incremental Units"] = calculated_incremental
@@ -183,20 +185,16 @@ def validate_and_prepare(raw_df):
 
             df["Source Incremental Units"] = scaled_inc
             df["Incremental Units"] = df["Source Incremental Units"].fillna(calculated_incremental)
-            df["Incremental Source"] = np.where(df["Source Incremental Units"].notna(), "Source measure", "Calculated fallback")
         else:
             df["Source Incremental Units"] = np.nan
             df["Incremental Units"] = calculated_incremental
-            df["Incremental Source"] = "Calculated fallback"
-
-        df["Incremental % of Baseline"] = np.where(df["Baseline Units"] > 0, (df["Incremental Units"] / df["Baseline Units"]) * 100, np.nan)
     else:
-        df["Baseline Units"] = np.nan
-        df["Source Incremental Units"] = np.nan
-        df["Calculated Incremental Units"] = np.nan
-        df["Incremental Units"] = np.nan
-        df["Incremental Source"] = "Unavailable"
-        df["Incremental % of Baseline"] = np.nan
+        # Fallback for 26-week extracts missing explicit baseline columns
+        df["Baseline Units"] = df["Sales Units"]
+        df["Baseline Value"] = df["Sales Value"]
+        df["Source Incremental Units"] = 0.0
+        df["Calculated Incremental Units"] = 0.0
+        df["Incremental Units"] = 0.0
 
     # Distribution & Dimensions
     if "Numeric Distribution" in df.columns:
@@ -234,6 +232,7 @@ def aggregate_weekly(df):
             Baseline_Units=("Baseline Units", "sum"),
             Incremental_Units=("Incremental Units", "sum"),
             Sales_Value=("Sales Value", "sum"),
+            Baseline_Value=("Baseline Value", "sum"),
             Distribution=("Numeric Distribution", "mean"),
         )
         .sort_values("date_key")
@@ -306,7 +305,6 @@ def run_baseline_model(series, horizon=4):
     best_model = "4-Week Moving Average"
     best_wmape = float("inf")
     
-    # Backtest models on trailing history
     min_train = 16 if len(y) >= 24 else 8
     if len(y) > min_train + horizon:
         for name, func in registry.items():
@@ -334,15 +332,10 @@ def run_baseline_model(series, horizon=4):
 # 6. 52-WEEK PROMOTIONAL OVERLAY & SA MACRO ELASTICITY
 # ============================================================
 def apply_52wk_promo_overlay_and_sa_macro(weekly, future_dates, base_volume_fcst, price_yoy, cpi_inflation, elasticity):
-    """
-    Overlays historical promotional lifts from 52 weeks prior (t - 52)
-    and adjusts for South African consumer affordability elasticity.
-    """
     adjusted_fcst_units = []
     promo_lift_factors = []
     ly_benchmark_units = []
 
-    # Calculate SA Macro Adjustment Factor
     net_price_squeeze = max(0.0, price_yoy - cpi_inflation)
     macro_factor = max(0.5, 1.0 + (elasticity * (net_price_squeeze / 100.0)))
 
@@ -355,14 +348,12 @@ def apply_52wk_promo_overlay_and_sa_macro(weekly, future_dates, base_volume_fcst
             ly_act_units = float(weekly.loc[closest_idx, "Sales_Units"])
             ly_base_units = float(weekly.loc[closest_idx, "Baseline_Units"])
             
-            # Promo Lift Factor = Last Year Actual / Last Year Baseline
             lift_factor = (ly_act_units / ly_base_units) if ly_base_units > 0 else 1.0
             lift_factor = max(1.0, lift_factor)
             
             ly_benchmark_units.append(ly_act_units)
             promo_lift_factors.append(lift_factor)
             
-            # Apply promotional lift adjusted by SA macro consumer elasticity
             effective_lift = 1.0 + ((lift_factor - 1.0) * macro_factor)
             adj_units = base_volume_fcst[idx] * effective_lift
             adjusted_fcst_units.append(adj_units)
@@ -378,49 +369,42 @@ def apply_52wk_promo_overlay_and_sa_macro(weekly, future_dates, base_volume_fcst
 # 7. PRESCRIPTIVE RECOMMENDATION ENGINE
 # ============================================================
 def generate_gap_closing_recommendations(scope_name, fcst_units_4wk, ly_units_4wk, fcst_val_4wk, ly_val_4wk, avg_rsp, promo_rsp, num_dist, brand_name):
-    """
-    Diagnoses YoY deficits and generates quantitative, gap-closing commercial actions.
-    """
     unit_deficit = ly_units_4wk - fcst_units_4wk
     unit_deficit_pct = (unit_deficit / ly_units_4wk) * 100 if ly_units_4wk > 0 else 0
     revenue_at_risk = max(0.0, ly_val_4wk - fcst_val_4wk)
 
     actions = []
 
-    # 1. Price Elasticity & Promotional Depth Recommendation
     promo_discount_pct = ((avg_rsp - promo_rsp) / avg_rsp) * 100 if avg_rsp > 0 else 0
-    target_promo_rsp = round(avg_rsp * 0.78, 2) # Target 22% promo depth
+    target_promo_rsp = round(avg_rsp * 0.78, 2)
     est_unit_recovery_promo = int(unit_deficit * 0.60)
     
     actions.append({
         "type": "Pricing & Promotion",
         "title": f"Deepen Promotional RSP to R {target_promo_rsp:.2f} (22% Promo Depth)",
-        "detail": f"Current promotional depth is running at {promo_discount_pct:.1f}%. Increasing promo depth to 22% (Target Promo RSP: R {target_promo_rsp:.2f}) is projected to stimulate demand and recover ~{est_unit_recovery_promo:,} units."
+        "detail": f"Current promo depth is running at {promo_discount_pct:.1f}%. Increasing promo depth to 22% (Target Promo RSP: R {target_promo_rsp:.2f}) is projected to recover ~{est_unit_recovery_promo:,} units."
     })
 
-    # 2. South Africa Payday & SASSA Liquidity Cycle Timing
     actions.append({
         "type": "Payday & SASSA Timing",
         "title": "Align Promotional Activations with Month-End Payday (25th - 1st)",
-        "detail": "South African FMCG demand is hyper-cyclical around payday and SASSA grant liquidity. Ensure co-op catalogue features and end-cap displays are scheduled strictly during payday weeks."
+        "detail": "South African FMCG demand is hyper-cyclical around payday and SASSA grant liquidity. Ensure catalogue features and end-cap displays are scheduled during payday weeks."
     })
 
-    # 3. Field Sales & Retail Distribution Fix
     if num_dist < 85.0:
         dist_gap = 85.0 - num_dist
         est_unit_recovery_dist = int(unit_deficit * 0.35)
         actions.append({
             "type": "Field Distribution Audit",
             "title": f"Field Sales Push: Audit & Recover +{dist_gap:.1f}% Numeric Distribution",
-            "detail": f"Numeric distribution is lagging at {num_dist:.1f}%. Out-of-stocks in Shoprite/Checkers, Pick n Pay, or Wholesale key accounts are dragging volume. Resolving stockouts will recover ~{est_unit_recovery_dist:,} units."
+            "detail": f"Numeric distribution is lagging at {num_dist:.1f}%. Resolving out-of-stocks in Shoprite/Checkers, Pick n Pay, or Wholesale key accounts will recover ~{est_unit_recovery_dist:,} units."
         })
 
-    # 4. Brand Conversion Intervention (Shield -> Rexona Roll-On Migration)
     if any(k in str(brand_name).lower() or k in str(scope_name).lower() for k in ["rexona", "shield"]):
         actions.append({
             "type": "Brand Rebrand Conversion",
             "title": "Deploy Co-Branded 'Shield is now Rexona' Shelf POS",
-            "detail": "Residual shopper confusion post-rebrand is causing shopper leakage. Allocate trade spend to shelf-talkers, secondary bay displays, and digital catalogue banners during peak traffic weeks."
+            "detail": "Shopper confusion post-rebrand is causing conversion leakage. Allocate trade spend to shelf-talkers and secondary bay displays during peak traffic weeks."
         })
 
     return {
@@ -441,7 +425,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Upload Weekly Sales CSV", type=["csv"])
 
 if uploaded_file is None:
-    st.info("👈 Upload your Unilever 52-week sales CSV extract in the left sidebar to start.")
+    st.info("👈 Upload your Unilever sales CSV extract in the left sidebar to start.")
     st.stop()
 
 try:
@@ -468,12 +452,11 @@ with st.sidebar:
     
     price_yoy = st.sidebar.number_input("Unilever YoY RSP Increase (%)", min_value=0.0, max_value=30.0, value=8.5, step=0.5)
     cpi_inflation = st.sidebar.number_input("SA Food CPI Inflation (%)", min_value=0.0, max_value=30.0, value=5.2, step=0.5)
-    elasticity = st.sidebar.slider("Price Elasticity Coefficient (ε)", min_value=-2.5, max_value=-0.1, value=-1.1, step=0.1, help="Standard SA FMCG elasticity ranges between -0.8 and -1.5.")
+    elasticity = st.sidebar.slider("Price Elasticity Coefficient (ε)", min_value=-2.5, max_value=-0.1, value=-1.1, step=0.1)
     
     st.sidebar.markdown("---")
     st.sidebar.subheader("🔍 Hierarchy Filters")
 
-    # Cascading Filters
     categories = ["All"] + sorted(df_clean["Category"].unique().tolist())
     category = st.selectbox("1. Category", categories)
     d1 = df_clean if category == "All" else df_clean[df_clean["Category"] == category]
@@ -489,7 +472,6 @@ with st.sidebar:
     product_options = ["All"] + sorted(d3["Product"].unique().tolist())
     selected_products = st.multiselect("4. Product SKU(s)", options=product_options, default=["All"])
 
-    # Determine Final Filter Scope
     if "All" in selected_products or not selected_products:
         final_df = d3.copy()
         product_label = f"All Products in {brand if brand != 'All' else 'Portfolio'}"
@@ -516,20 +498,18 @@ if len(weekly) < 4:
 last_date = weekly["date_key"].max()
 future_dates = [last_date + timedelta(weeks=i) for i in range(1, forecast_horizon + 1)]
 
-# 1. Base Unconstrained Baseline Forecast
+# Base Unconstrained Forecasts
 base_volume_fcst, champion_model, model_wmape = run_baseline_model(weekly["Baseline_Units"].values, forecast_horizon)
-base_value_fcst, val_model, val_wmape = run_baseline_model(weekly["Sales_Value"].values, forecast_horizon)
+base_value_fcst, val_model, val_wmape = run_baseline_model(weekly["Baseline_Value"].values, forecast_horizon)
 
-# 2. 52-Week Promotional Overlay + SA Macro Elasticity Adjustment
+# 52-Week Promotional Overlay + SA Macro Elasticity Adjustment
 final_volume_fcst, promo_lifts, ly_benchmark_units, macro_factor = apply_52wk_promo_overlay_and_sa_macro(
     weekly, future_dates, base_volume_fcst, price_yoy, cpi_inflation, elasticity
 )
 
-# Sales Value Forecast scales with adjusted volume
 avg_rsp_latest = weekly["Effective_RSP"].iloc[-1] if weekly["Effective_RSP"].iloc[-1] > 0 else 25.0
 final_value_fcst = final_volume_fcst * avg_rsp_latest
 
-# Calculate Summary Totals
 fcst_4wk_units = sum(final_volume_fcst)
 fcst_4wk_val = sum(final_value_fcst)
 
@@ -541,7 +521,6 @@ latest_dist = weekly["Distribution"].iloc[-1]
 
 scope_label = f"{category} > {subcategory} > {brand} > {product_label}"
 
-# Run Prescriptive Diagnostics
 diagnostics = generate_gap_closing_recommendations(
     scope_label, fcst_4wk_units, ly_4wk_units, fcst_4wk_val, ly_4wk_val,
     avg_rsp_latest, latest_promo_rsp, latest_dist, brand
@@ -562,7 +541,6 @@ col4.metric("Revenue at Risk", f"R {diagnostics['revenue_at_risk']:,.2f}")
 st.markdown("---")
 
 
-# Prescriptive Recommendation Alert Panel
 if diagnostics["unit_deficit_pct"] > 0:
     st.markdown(f"""
     <div class='alert-card'>
@@ -610,7 +588,7 @@ if "Units" in metric_toggle:
         line=dict(color="#EA580C", width=2, dash="dot"), marker=dict(size=4)
     ))
 
-    # Seamless Anchor Point (Connecting last historical point to forecast)
+    # Seamless Anchor Point
     anchor_x = [weekly["date_key"].iloc[-1]] + future_dates
     anchor_y = [float(weekly["Sales_Units"].iloc[-1])] + list(final_volume_fcst)
 
@@ -628,7 +606,6 @@ if "Units" in metric_toggle:
         line=dict(color="#D97706", width=2, dash="dot"), marker=dict(size=5)
     ))
 
-    # Confidence Band
     upper_bound = [u * 1.12 for u in final_volume_fcst]
     lower_bound = [u * 0.88 for u in final_volume_fcst]
     fig.add_trace(go.Scatter(
@@ -652,7 +629,6 @@ else:
     anchor_x = [weekly["date_key"].iloc[-1]] + future_dates
     anchor_y = [float(weekly["Sales_Value"].iloc[-1])] + list(final_value_fcst)
 
-    # Forecast Value Line
     fig.add_trace(go.Scatter(
         x=anchor_x, y=anchor_y,
         mode="lines+markers", name="Revenue Forecast",
