@@ -219,14 +219,28 @@ def prepare_csv(csv_bytes):
 
 
 # ============================================================
-# 4. WEEKLY AGGREGATION ENGINE
+# 4. SAFE WEEKLY AGGREGATION ENGINE
 # ============================================================
 def aggregate_weekly(df):
     if df.empty:
         return pd.DataFrame()
 
+    df_copy = df.copy()
+
+    # Defensively ensure required columns exist to avoid KeyErrors
+    for col, default_val in [
+        ("Sales Units", 0.0),
+        ("Sales Value", 0.0),
+        ("Baseline Units", 0.0),
+        ("Baseline Value", 0.0),
+        ("Incremental Units", 0.0),
+        ("Numeric Distribution", 85.0),
+    ]:
+        if col not in df_copy.columns:
+            df_copy[col] = default_val
+
     base = (
-        df.groupby("date_key", as_index=False)
+        df_copy.groupby("date_key", as_index=False)
         .agg(
             Sales_Units=("Sales Units", "sum"),
             Baseline_Units=("Baseline Units", "sum"),
@@ -242,17 +256,20 @@ def aggregate_weekly(df):
     base["Incremental_Units"] = base["Sales_Units"] - base["Baseline_Units"]
     base["Effective_RSP"] = np.where(base["Sales_Units"] > 0, base["Sales_Value"] / base["Sales_Units"], np.nan)
 
-    promo_part = df.copy()
-    promo_part["Promo_RSP"] = pd.to_numeric(promo_part["Promo RSP"], errors="coerce")
-    promo_part = promo_part[(promo_part["Promo_RSP"] > 0) & (promo_part["Sales Units"] > 0)].copy()
+    if "Promo RSP" in df_copy.columns:
+        promo_part = df_copy.copy()
+        promo_part["Promo_RSP"] = pd.to_numeric(promo_part["Promo RSP"], errors="coerce")
+        promo_part = promo_part[(promo_part["Promo_RSP"] > 0) & (promo_part["Sales Units"] > 0)].copy()
 
-    if promo_part.empty:
-        base["Promo_RSP_Weighted"] = np.nan
+        if not promo_part.empty:
+            promo_part["Promo_Value_Proxy"] = promo_part["Promo_RSP"] * promo_part["Sales Units"]
+            promo_week = promo_part.groupby("date_key").agg(Promo_Value_Proxy=("Promo_Value_Proxy", "sum"), Promo_Units=("Sales Units", "sum")).reset_index()
+            promo_week["Promo_RSP_Weighted"] = np.where(promo_week["Promo_Units"] > 0, promo_week["Promo_Value_Proxy"] / promo_week["Promo_Units"], np.nan)
+            base = base.merge(promo_week[["date_key", "Promo_RSP_Weighted"]], on="date_key", how="left")
+        else:
+            base["Promo_RSP_Weighted"] = np.nan
     else:
-        promo_part["Promo_Value_Proxy"] = promo_part["Promo_RSP"] * promo_part["Sales Units"]
-        promo_week = promo_part.groupby("date_key").agg(Promo_Value_Proxy=("Promo_Value_Proxy", "sum"), Promo_Units=("Sales Units", "sum")).reset_index()
-        promo_week["Promo_RSP_Weighted"] = np.where(promo_week["Promo_Units"] > 0, promo_week["Promo_Value_Proxy"] / promo_week["Promo_Units"], np.nan)
-        base = base.merge(promo_week[["date_key", "Promo_RSP_Weighted"]], on="date_key", how="left")
+        base["Promo_RSP_Weighted"] = np.nan
 
     base["Promo_Depth_%"] = np.where(
         (base["Effective_RSP"] > 0) & base["Promo_RSP_Weighted"].notna(),
@@ -517,7 +534,7 @@ ly_4wk_units = sum(ly_benchmark_units)
 ly_4wk_val = ly_4wk_units * avg_rsp_latest
 
 latest_promo_rsp = weekly["Promo_RSP_Weighted"].iloc[-1] if "Promo_RSP_Weighted" in weekly.columns and pd.notna(weekly["Promo_RSP_Weighted"].iloc[-1]) else avg_rsp_latest * 0.82
-latest_dist = weekly["Distribution"].iloc[-1]
+latest_dist = weekly["Distribution"].iloc[-1] if "Distribution" in weekly.columns else 85.0
 
 scope_label = f"{category} > {subcategory} > {brand} > {product_label}"
 
