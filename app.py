@@ -417,7 +417,7 @@ def choose_forecast_series(weekly):
 
 
 # ============================================================
-# 6. 52-WEEK PROMOTIONAL OVERLAY & SA MACRO ELASTICITY
+# 6. 52-WEEK SEASONALITY + PROMOTIONAL OVERLAY & SA MACRO ELASTICITY
 # ============================================================
 def apply_52wk_promo_overlay_and_sa_macro(
     weekly,
@@ -428,44 +428,119 @@ def apply_52wk_promo_overlay_and_sa_macro(
     elasticity,
     apply_promo_overlay=True,
 ):
+    """
+    Final forecast logic:
+
+        Base Forecast
+        × 52-Week Seasonal Index
+        × Promotional Lift
+        × SA Macro Factor
+
+    Seasonality uses the prior-year baseline for the matching week
+    relative to the historical median weekly baseline.
+
+    Promotional lift uses LY Actual / LY Baseline.
+
+    This keeps seasonality and promotion as separate effects and avoids
+    adding LY sales directly to the forecast.
+    """
+
     adjusted_fcst_units = []
     promo_lift_factors = []
     ly_benchmark_units = []
+    seasonal_factors = []
 
+    # Historical reference level used to calculate the seasonal index.
+    baseline_series = (
+        pd.to_numeric(weekly["Baseline_Units"], errors="coerce")
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+    baseline_series = baseline_series[baseline_series > 0]
+
+    if not baseline_series.empty:
+        baseline_reference = float(baseline_series.median())
+    else:
+        # If there is no usable baseline, use historical actuals as the
+        # seasonal reference.
+        actual_series = (
+            pd.to_numeric(weekly["Sales_Units"], errors="coerce")
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+        actual_series = actual_series[actual_series > 0]
+        baseline_reference = float(actual_series.median()) if not actual_series.empty else 0.0
+
+    # SA macro adjustment.
     net_price_squeeze = max(0.0, price_yoy - cpi_inflation)
-    macro_factor = float(np.clip(1.0 + (elasticity * (net_price_squeeze / 100.0)), 0.5, 1.5))
+    macro_factor = float(
+        np.clip(
+            1.0 + (elasticity * (net_price_squeeze / 100.0)),
+            0.5,
+            1.5,
+        )
+    )
 
     for idx, f_date in enumerate(future_dates):
         target_ly_date = f_date - timedelta(weeks=52)
         dist = (weekly["date_key"] - target_ly_date).abs().dt.days
         closest_idx = dist.idxmin()
 
+        seasonal_factor = 1.0
         lift_factor = 1.0
+        ly_act_units = np.nan
+
+        # Match the future week to the closest LY week.
         if dist.loc[closest_idx] <= 7:
             ly_act_units = float(weekly.loc[closest_idx, "Sales_Units"])
             ly_base_units = float(weekly.loc[closest_idx, "Baseline_Units"])
 
-            raw_lift = (ly_act_units / ly_base_units) if ly_base_units > 0 else 1.0
-            # Only use a historical promo lift when the baseline is plausible.
-            if apply_promo_overlay and 0.50 <= raw_lift <= 3.00:
-                lift_factor = max(1.0, raw_lift)
-            ly_benchmark_units.append(ly_act_units)
-        else:
-            ly_benchmark_units.append(np.nan)
+            # --------------------------------------------------------
+            # 1. 52-week seasonal index
+            # --------------------------------------------------------
+            if ly_base_units > 0 and baseline_reference > 0:
+                seasonal_factor = ly_base_units / baseline_reference
 
+                # Cap the influence of an abnormal LY week.
+                seasonal_factor = float(
+                    np.clip(seasonal_factor, 0.50, 1.50)
+                )
+
+            # --------------------------------------------------------
+            # 2. Promotional lift
+            # --------------------------------------------------------
+            if ly_base_units > 0:
+                raw_lift = ly_act_units / ly_base_units
+
+                if apply_promo_overlay and 0.50 <= raw_lift <= 3.00:
+                    lift_factor = max(1.0, raw_lift)
+
+        seasonal_factors.append(seasonal_factor)
         promo_lift_factors.append(lift_factor)
+        ly_benchmark_units.append(
+            ly_act_units if pd.notna(ly_act_units) else np.nan
+        )
 
-        # Apply macro price elasticity to base demand. Add promo lift only when
-        # forecasting from a validated baseline; otherwise historical promotion
-        # is already embedded in the actual-sales forecast and must not be doubled.
-        adj_units = base_volume_fcst[idx] * macro_factor
+        # ------------------------------------------------------------
+        # Final forecast
+        # ------------------------------------------------------------
+        adj_units = float(base_volume_fcst[idx]) * seasonal_factor * macro_factor
+
+        # Only apply promo lift when the forecast is based on a validated
+        # baseline. For an actual-sales forecast, promotion is already part
+        # of the historical demand signal and should not be added again.
         if apply_promo_overlay:
-            effective_lift = 1.0 + ((lift_factor - 1.0) * macro_factor)
-            adj_units *= effective_lift
+            adj_units *= lift_factor
 
         adjusted_fcst_units.append(max(0.0, float(adj_units)))
 
-    return np.array(adjusted_fcst_units), promo_lift_factors, ly_benchmark_units, macro_factor
+    return (
+        np.array(adjusted_fcst_units),
+        promo_lift_factors,
+        ly_benchmark_units,
+        seasonal_factors,
+        macro_factor,
+    )
 
 
 # ============================================================
@@ -623,7 +698,13 @@ base_volume_fcst, champion_model, model_wmape = run_baseline_model(
 # Do not stack a promo lift on top of an actual-sales forecast because that
 # would count historical promotion twice.
 apply_promo_overlay = forecast_source == "Baseline Units"
-final_volume_fcst, promo_lifts, ly_benchmark_units, macro_factor = apply_52wk_promo_overlay_and_sa_macro(
+(
+    final_volume_fcst,
+    promo_lifts,
+    ly_benchmark_units,
+    seasonal_factors,
+    macro_factor,
+) = apply_52wk_promo_overlay_and_sa_macro(
     weekly,
     future_dates,
     base_volume_fcst,
@@ -659,8 +740,8 @@ diagnostics = generate_gap_closing_recommendations(
 st.markdown(f"### Active Scope: **{scope_label}**")
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("4-Wk Volume Forecast", f"{fcst_4wk_units:,.0f} units")
-col2.metric("4-Wk Revenue Forecast", f"R {fcst_4wk_val:,.2f}")
+col1.metric(f"{forecast_horizon}-Wk Volume Forecast", f"{fcst_4wk_units:,.0f} units")
+col2.metric(f"{forecast_horizon}-Wk Revenue Forecast", f"R {fcst_4wk_val:,.2f}")
 col3.metric("YoY Volume Variance", f"-{diagnostics['unit_deficit_pct']:.1f}%", delta=f"-{diagnostics['unit_deficit_pct']:.1f}%", delta_color="inverse")
 col4.metric("Revenue at Risk", f"R {diagnostics['revenue_at_risk']:,.2f}")
 
@@ -670,7 +751,7 @@ st.markdown("---")
 if diagnostics["unit_deficit_pct"] > 0:
     st.markdown(f"""
     <div class='alert-card'>
-        <h4 style='margin:0; color:#991B1B;'>🚨 YoY Deficit Alert: 4-Week Forecast is {diagnostics['unit_deficit_pct']:.1f}% Below Last Year</h4>
+        <h4 style='margin:0; color:#991B1B;'>🚨 YoY Deficit Alert: {forecast_horizon}-Week Forecast is {diagnostics['unit_deficit_pct']:.1f}% Below Last Year</h4>
         <p style='margin-top:4px; margin-bottom:0; color:#7F1D1D; font-size:14px;'>
             Projected Revenue Shortfall: <strong>R {diagnostics['revenue_at_risk']:,.2f}</strong>. 
             Commercial actions to close the gap before execution:
@@ -724,7 +805,7 @@ if "Units" in metric_toggle:
         x=anchor_x, y=anchor_y,
         mode="lines+markers", name=(
             f"Forecast | {champion_model}"
-            + (" | 52-Wk Promo Overlay" if apply_promo_overlay else " | Actual-based")
+            + (" | 52-Wk Seasonality + Promo" if apply_promo_overlay else " | 52-Wk Seasonality + Actual-based")
         ),
         line=dict(color="#059669", width=3, dash="dash"), marker=dict(size=7, symbol="diamond")
     ))
@@ -817,6 +898,14 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
+st.caption(
+    f"Forecast Formula: **Base Forecast × 52-Wk Seasonality × Promo Lift × Macro Factor** | "
+    f"Forecast Source: **{forecast_source}** | "
+    f"Baseline Engine: **{champion_model}** | "
+    f"SA Macro Factor: **{macro_factor:.4f}** "
+    f"(Net Price Squeeze: {max(0, price_yoy - cpi_inflation):.1f}%)"
+)
 
 forecast_method_text = (
     f"The forecast is based on **{forecast_source}** using **{champion_model}**. "
