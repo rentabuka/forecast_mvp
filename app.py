@@ -448,6 +448,7 @@ def apply_52wk_promo_overlay_and_sa_macro(
     adjusted_fcst_units = []
     promo_lift_factors = []
     ly_benchmark_units = []
+    ly_benchmark_values = []
     seasonal_factors = []
 
     # Historical reference level used to calculate the seasonal index.
@@ -489,10 +490,12 @@ def apply_52wk_promo_overlay_and_sa_macro(
         seasonal_factor = 1.0
         lift_factor = 1.0
         ly_act_units = np.nan
+        ly_act_value = np.nan
 
         # Match the future week to the closest LY week.
         if dist.loc[closest_idx] <= 7:
             ly_act_units = float(weekly.loc[closest_idx, "Sales_Units"])
+            ly_act_value = float(weekly.loc[closest_idx, "Sales_Value"])
             ly_base_units = float(weekly.loc[closest_idx, "Baseline_Units"])
 
             # --------------------------------------------------------
@@ -520,6 +523,9 @@ def apply_52wk_promo_overlay_and_sa_macro(
         ly_benchmark_units.append(
             ly_act_units if pd.notna(ly_act_units) else np.nan
         )
+        ly_benchmark_values.append(
+            ly_act_value if pd.notna(ly_act_value) else np.nan
+        )
 
         # ------------------------------------------------------------
         # Final forecast
@@ -538,6 +544,7 @@ def apply_52wk_promo_overlay_and_sa_macro(
         np.array(adjusted_fcst_units),
         promo_lift_factors,
         ly_benchmark_units,
+        ly_benchmark_values,
         seasonal_factors,
         macro_factor,
     )
@@ -546,52 +553,72 @@ def apply_52wk_promo_overlay_and_sa_macro(
 # ============================================================
 # 7. PRESCRIPTIVE RECOMMENDATION ENGINE
 # ============================================================
-def generate_gap_closing_recommendations(scope_name, fcst_units_4wk, ly_units_4wk, fcst_val_4wk, ly_val_4wk, avg_rsp, promo_rsp, num_dist, brand_name):
-    unit_deficit = ly_units_4wk - fcst_units_4wk
-    unit_deficit_pct = (unit_deficit / ly_units_4wk) * 100 if ly_units_4wk > 0 else 0
-    revenue_at_risk = max(0.0, ly_val_4wk - fcst_val_4wk)
-
+def generate_gap_closing_recommendations(
+    scope_name, fcst_units, ly_units, fcst_value, ly_value,
+    avg_rsp, promo_rsp, num_dist, brand_name
+):
+    """Compare forecast with matched LY actuals; avoid unvalidated uplift claims."""
+    unit_gap = fcst_units - ly_units
+    unit_gap_pct = (unit_gap / ly_units) * 100 if ly_units > 0 else np.nan
+    value_gap = fcst_value - ly_value
+    revenue_at_risk = max(0.0, -value_gap)
     actions = []
 
-    promo_discount_pct = ((avg_rsp - promo_rsp) / avg_rsp) * 100 if avg_rsp > 0 else 0
-    target_promo_rsp = round(avg_rsp * 0.78, 2)
-    est_unit_recovery_promo = int(unit_deficit * 0.60)
-    
-    actions.append({
-        "type": "Pricing & Promotion",
-        "title": f"Deepen Promotional RSP to R {target_promo_rsp:.2f} (22% Promo Depth)",
-        "detail": f"Current promo depth is running at {promo_discount_pct:.1f}%. Increasing promo depth to 22% (Target Promo RSP: R {target_promo_rsp:.2f}) is projected to recover ~{est_unit_recovery_promo:,} units."
-    })
-
-    actions.append({
-        "type": "Payday & SASSA Timing",
-        "title": "Align Promotional Activations with Month-End Payday (25th - 1st)",
-        "detail": "South African FMCG demand is hyper-cyclical around payday and SASSA grant liquidity. Ensure catalogue features and end-cap displays are scheduled during payday weeks."
-    })
-
-    if num_dist < 85.0:
-        dist_gap = 85.0 - num_dist
-        est_unit_recovery_dist = int(unit_deficit * 0.35)
+    if unit_gap < 0:
+        promo_text = f"R {promo_rsp:,.2f}" if pd.notna(promo_rsp) else "not available"
         actions.append({
-            "type": "Field Distribution Audit",
-            "title": f"Field Sales Push: Audit & Recover +{dist_gap:.1f}% Numeric Distribution",
-            "detail": f"Numeric distribution is lagging at {num_dist:.1f}%. Resolving out-of-stocks in Shoprite/Checkers, Pick n Pay, or Wholesale key accounts will recover ~{est_unit_recovery_dist:,} units."
+            "type": "Pricing & Promotion",
+            "title": "Evaluate a price/promotion recovery scenario",
+            "detail": (
+                f"The forecast is {abs(unit_gap):,.0f} units below the matched prior-year period. "
+                f"Current effective RSP is R {avg_rsp:,.2f}; latest observed promo RSP is {promo_text}. "
+                "Test several price points against historical promotional weeks and validate the "
+                "incremental volume response before committing trade spend. No uplift is assumed here."
+            )
         })
-
-    if any(k in str(brand_name).lower() or k in str(scope_name).lower() for k in ["rexona", "shield"]):
         actions.append({
-            "type": "Brand Rebrand Conversion",
-            "title": "Deploy Co-Branded 'Shield is now Rexona' Shelf POS",
-            "detail": "Shopper confusion post-rebrand is causing conversion leakage. Allocate trade spend to shelf-talkers and secondary bay displays during peak traffic weeks."
+            "type": "Payday & SASSA Timing",
+            "title": "Check promotional timing against payday and SASSA dates",
+            "detail": (
+                "Compare the forecast weeks with actual payday/SASSA payment dates and prior-year "
+                "weekly sales. Shift timing only where your own EPOS history shows a repeatable uplift."
+            )
+        })
+        if pd.notna(num_dist) and num_dist < 85.0:
+            actions.append({
+                "type": "Distribution",
+                "title": f"Investigate distribution gap (latest numeric distribution: {num_dist:.1f}%)",
+                "detail": (
+                    "Review distribution and availability by customer/account, including out-of-stocks "
+                    "and lost listings. Quantify the opportunity from store/SKU-level data before "
+                    "assigning a recoverable-unit estimate."
+                )
+            })
+        if any(k in str(brand_name).lower() or k in str(scope_name).lower() for k in ["rexona", "shield"]):
+            actions.append({
+                "type": "Brand Execution",
+                "title": "Check shelf execution and brand navigation",
+                "detail": "Review store-level availability, shelf visibility and any brand-transition issues before assigning a sales impact."
+            })
+    else:
+        actions.append({
+            "type": "Forecast Monitoring",
+            "title": "Protect the forecasted performance",
+            "detail": (
+                f"The forecast is at or above the matched prior-year volume by {unit_gap:,.0f} units. "
+                "Monitor distribution, price and promotional execution to check that forecast assumptions remain valid."
+            )
         })
 
     return {
-        "unit_deficit": unit_deficit,
-        "unit_deficit_pct": unit_deficit_pct,
+        "unit_deficit": max(0.0, -unit_gap),
+        "unit_gap": unit_gap,
+        "unit_deficit_pct": max(0.0, -unit_gap_pct) if pd.notna(unit_gap_pct) else np.nan,
+        "unit_variance_pct": unit_gap_pct,
+        "value_gap": value_gap,
         "revenue_at_risk": revenue_at_risk,
         "actions": actions
     }
-
 
 # ============================================================
 # 8. STREAMLIT APP LAYOUT & SIDEBAR FILTERS
@@ -702,6 +729,7 @@ apply_promo_overlay = forecast_source == "Baseline Units"
     final_volume_fcst,
     promo_lifts,
     ly_benchmark_units,
+    ly_benchmark_values,
     seasonal_factors,
     macro_factor,
 ) = apply_52wk_promo_overlay_and_sa_macro(
@@ -717,41 +745,84 @@ apply_promo_overlay = forecast_source == "Baseline Units"
 avg_rsp_latest = weekly["Effective_RSP"].iloc[-1] if weekly["Effective_RSP"].iloc[-1] > 0 else 25.0
 final_value_fcst = final_volume_fcst * avg_rsp_latest
 
-fcst_4wk_units = sum(final_volume_fcst)
-fcst_4wk_val = sum(final_value_fcst)
+fcst_4wk_units = float(np.nansum(final_volume_fcst))
+fcst_4wk_val = float(np.nansum(final_value_fcst))
 
-ly_4wk_units = sum(ly_benchmark_units)
-ly_4wk_val = ly_4wk_units * avg_rsp_latest
+# Compare forecast and LY actuals over the same matched weeks only.
+# Do not reprice LY units at today's RSP or compare a full forecast to a partial LY period.
+matched_ly_mask = np.isfinite(ly_benchmark_values) & np.isfinite(ly_benchmark_units)
+matched_ly_weeks = int(matched_ly_mask.sum())
+if matched_ly_weeks:
+    comparison_fcst_units = float(np.nansum(final_volume_fcst[matched_ly_mask]))
+    comparison_fcst_value = float(np.nansum(final_value_fcst[matched_ly_mask]))
+    ly_4wk_units = float(np.nansum(np.asarray(ly_benchmark_units)[matched_ly_mask]))
+    ly_4wk_val = float(np.nansum(np.asarray(ly_benchmark_values)[matched_ly_mask]))
+else:
+    comparison_fcst_units = np.nan
+    comparison_fcst_value = np.nan
+    ly_4wk_units = np.nan
+    ly_4wk_val = np.nan
 
 latest_promo_rsp = weekly["Promo_RSP_Weighted"].iloc[-1] if "Promo_RSP_Weighted" in weekly.columns and pd.notna(weekly["Promo_RSP_Weighted"].iloc[-1]) else avg_rsp_latest * 0.82
 latest_dist = weekly["Distribution"].iloc[-1] if "Distribution" in weekly.columns else 85.0
 
 scope_label = f"{category} > {subcategory} > {brand} > {product_label}"
 
-diagnostics = generate_gap_closing_recommendations(
-    scope_label, fcst_4wk_units, ly_4wk_units, fcst_4wk_val, ly_4wk_val,
-    avg_rsp_latest, latest_promo_rsp, latest_dist, brand
-)
+if matched_ly_weeks:
+    diagnostics = generate_gap_closing_recommendations(
+        scope_label, comparison_fcst_units, ly_4wk_units, comparison_fcst_value, ly_4wk_val,
+        avg_rsp_latest, latest_promo_rsp, latest_dist, brand
+    )
+else:
+    diagnostics = {
+        "unit_deficit": np.nan,
+        "unit_gap": np.nan,
+        "unit_deficit_pct": np.nan,
+        "unit_variance_pct": np.nan,
+        "value_gap": np.nan,
+        "revenue_at_risk": np.nan,
+        "actions": [],
+    }
 
 
 # ============================================================
 # 10. DASHBOARD METRICS & PRESCRIPTIVE PANEL
 # ============================================================
 st.markdown(f"### Active Scope: **{scope_label}**")
+if matched_ly_weeks == 0:
+    st.warning(
+        "No forecast weeks could be matched to prior-year observations within 7 days. "
+        "YoY variance and revenue-at-risk metrics are unavailable; upload a date range containing "
+        "the corresponding prior-year weeks."
+    )
+elif matched_ly_weeks < forecast_horizon:
+    st.warning(
+        f"Only {matched_ly_weeks} of {forecast_horizon} forecast weeks have a matched prior-year "
+        "observation within 7 days. YoY comparisons cover matched weeks only; check the date range "
+        "before interpreting the gap."
+    )
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric(f"{forecast_horizon}-Wk Volume Forecast", f"{fcst_4wk_units:,.0f} units")
 col2.metric(f"{forecast_horizon}-Wk Revenue Forecast", f"R {fcst_4wk_val:,.2f}")
-col3.metric("YoY Volume Variance", f"-{diagnostics['unit_deficit_pct']:.1f}%", delta=f"-{diagnostics['unit_deficit_pct']:.1f}%", delta_color="inverse")
-col4.metric("Revenue at Risk", f"R {diagnostics['revenue_at_risk']:,.2f}")
+col3.metric(
+    "YoY Volume Variance",
+    f"{diagnostics['unit_variance_pct']:+.1f}%" if pd.notna(diagnostics["unit_variance_pct"]) else "N/A",
+    delta=f"{diagnostics['unit_variance_pct']:+.1f}%" if pd.notna(diagnostics["unit_variance_pct"]) else None,
+    delta_color="normal",
+)
+col4.metric(
+    "Revenue at Risk",
+    f"R {diagnostics['revenue_at_risk']:,.2f}" if pd.notna(diagnostics["revenue_at_risk"]) else "N/A",
+)
 
 st.markdown("---")
 
 
-if diagnostics["unit_deficit_pct"] > 0:
+if pd.notna(diagnostics["unit_deficit_pct"]) and diagnostics["unit_deficit_pct"] > 0:
     st.markdown(f"""
     <div class='alert-card'>
-        <h4 style='margin:0; color:#991B1B;'>🚨 YoY Deficit Alert: {forecast_horizon}-Week Forecast is {diagnostics['unit_deficit_pct']:.1f}% Below Last Year</h4>
+        <h4 style='margin:0; color:#991B1B;'>🚨 YoY Deficit Alert: Forecast is {diagnostics['unit_deficit_pct']:.1f}% Below Last Year for {matched_ly_weeks} matched week(s)</h4>
         <p style='margin-top:4px; margin-bottom:0; color:#7F1D1D; font-size:14px;'>
             Projected Revenue Shortfall: <strong>R {diagnostics['revenue_at_risk']:,.2f}</strong>. 
             Commercial actions to close the gap before execution:
@@ -928,6 +999,7 @@ table_df = pd.DataFrame({
     "Selected Forecast Units": final_volume_fcst,
     "Forecast Revenue": final_value_fcst,
     "Same Week LY Units": ly_benchmark_units,
+    "Same Week LY Sales Value": ly_benchmark_values,
 })
 
 st.dataframe(
@@ -936,6 +1008,7 @@ st.dataframe(
         "Selected Forecast Units": "{:,.0f}",
         "Forecast Revenue": "R {:,.2f}",
         "Same Week LY Units": "{:,.0f}",
+        "Same Week LY Sales Value": "R {:,.2f}",
     }),
     use_container_width=True, hide_index=True
 )
