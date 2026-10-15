@@ -32,6 +32,12 @@ LY_MATCH_TOLERANCE_DAYS = 3          # weekly data: LY week must be within 3 day
 SEASONAL_CLIP = (0.50, 1.50)         # cap the influence of an abnormal LY week
 MAX_BACKTEST_ORIGINS = 12            # rolling-origin folds per model (speed vs robustness)
 SEASONAL_SUFFIX = " + 52-Wk Seasonality"
+PAYDAY_SUFFIX = " + Payday Cycle"
+# Candidate payday windows (first day, last day of month-end window, week label convention).
+# The best one is learned from each training sample, so the backtest stays honest.
+PAYDAY_GRID = [(lo, hi, mode) for lo in (23, 25, 28) for hi in (1, 3, 5) for mode in ("end", "start")]
+PAYDAY_MAX_EFFECT = 0.25             # max log-uplift per payday day in the week
+PARTIAL_WEEK_SHARE = 0.60            # edge weeks with < 60% of the usual row count are incomplete
 TIE_BAND_PCT = 10.0                  # levers within 10 pts of gap closure compete on revenue
 
 
@@ -106,6 +112,24 @@ def validate_and_prepare(raw_df):
         df = df.dropna(subset=["date_key"]).copy()
     if df.empty:
         return False, ["No valid dated rows remain after date validation."], warnings_list, None, None
+
+    # Incomplete first/last weeks (part-week extracts) look like a sales collapse and drag
+    # the forecast down, so they are removed.
+    rows_per_week = df.groupby("date_key").size().sort_index()
+    usual = rows_per_week.median()
+    partial = []
+    for edge in (rows_per_week, rows_per_week[::-1]):
+        for wk, cnt in edge.items():
+            if cnt < PARTIAL_WEEK_SHARE * usual:
+                partial.append(wk)
+            else:
+                break
+    if partial and len(partial) < len(rows_per_week) - 4:
+        df = df[~df["date_key"].isin(partial)].copy()
+        warnings_list.append(
+            "Removed incomplete week(s) with far fewer rows than usual: "
+            + ", ".join(pd.Timestamp(w).strftime("%d %b %Y") for w in sorted(set(partial))) + "."
+        )
 
     df["Sales Value"] = clean_number(df[measures["value"]]).fillna(0).clip(lower=0)
     df["Ave RSP"] = clean_number(df[measures["price"]])
@@ -231,7 +255,10 @@ def flag_promo_weeks(weekly):
 
     if baseline_is_distinct(weekly):
         lift = weekly["Sales_Units"] / weekly["Baseline_Units"].where(weekly["Baseline_Units"] > 0)
-        flags |= (lift >= 1.10).fillna(False)
+        # Across many SKUs some promotion runs every week, so a "promo week" is one whose
+        # lift is clearly above this scope's normal level.
+        threshold = max(1.10, float(lift.median()) + 0.10) if lift.notna().any() else 1.10
+        flags |= (lift >= threshold).fillna(False)
 
     return flags
 
@@ -367,11 +394,15 @@ BASE_MODELS = {
 
 
 def candidate_names():
-    """Every base model is tested with and without a 52-week seasonal index."""
+    """Every base model is tested plain, with a 52-week seasonal index and with the payday cycle."""
     names = []
     for base_name in BASE_MODELS:
-        names += [base_name, base_name + SEASONAL_SUFFIX]
+        names += [base_name, base_name + SEASONAL_SUFFIX, base_name + PAYDAY_SUFFIX]
     return names
+
+
+def base_model_of(name):
+    return name.replace(SEASONAL_SUFFIX, "").replace(PAYDAY_SUFFIX, "")
 
 
 def _value_near(series_by_date, target, tol_days=LY_MATCH_TOLERANCE_DAYS):
@@ -412,17 +443,74 @@ def seasonal_factors(y, dates, future_dates, anchor_weeks=4):
     return np.array(factors)
 
 
+def payday_days(dates, lo, hi, mode):
+    """Number of days in each week that fall in the month-end payday window (lo..end, 1..hi)."""
+    offsets = range(7)
+    out = []
+    for label in pd.DatetimeIndex(dates):
+        days = [label - timedelta(days=k) for k in offsets] if mode == "end" else [label + timedelta(days=k) for k in offsets]
+        out.append(sum(1 for d in days if d.day >= lo or d.day <= hi))
+    return np.array(out, dtype=float)
+
+
+def fit_payday_cycle(y, dates):
+    """
+    Learn the SA month-end payday / SASSA effect from history:
+        log(sales) = level + trend + effect x (payday days in the week)
+    The window and week-label convention that fit best are chosen from PAYDAY_GRID.
+    Needs no prior-year data, so it works on short extracts. Returns None if no effect.
+    """
+    y = np.asarray(y, dtype=float)
+    ok = y > 0
+    if ok.sum() < 12:
+        return None
+    t = np.arange(len(y), dtype=float)
+    log_y = np.log(y[ok])
+    if log_y.var() <= 0:
+        return None
+    best = None
+    for lo, hi, mode in PAYDAY_GRID:
+        x = payday_days(dates, lo, hi, mode)
+        if np.std(x[ok]) == 0:
+            continue
+        X = np.column_stack([np.ones(ok.sum()), t[ok], x[ok]])
+        coef = np.linalg.lstsq(X, log_y, rcond=None)[0]
+        resid = log_y - X @ coef
+        r2 = 1 - resid.var() / log_y.var()
+        if best is None or r2 > best["r2"]:
+            best = {"r2": r2, "lo": lo, "hi": hi, "mode": mode, "beta": float(coef[2])}
+    if best is None or best["beta"] <= 0:
+        return None
+    best["beta"] = float(min(best["beta"], PAYDAY_MAX_EFFECT))
+    best["mean_x"] = float(payday_days(dates, best["lo"], best["hi"], best["mode"]).mean())
+    return best
+
+
+def payday_multipliers(fit, dates):
+    x = payday_days(dates, fit["lo"], fit["hi"], fit["mode"])
+    return np.exp(fit["beta"] * (x - fit["mean_x"]))
+
+
 def predict_candidate(name, y, dates, horizon):
     """Forecast with one candidate. Returns (forecast, seasonal_factors) or None if not possible."""
     y = np.asarray(y, dtype=float)
     dates = pd.DatetimeIndex(dates)
-    seasonal = name.endswith(SEASONAL_SUFFIX)
-    base_fcst = BASE_MODELS[name.replace(SEASONAL_SUFFIX, "")](y, horizon)
+    base_func = BASE_MODELS[base_model_of(name)]
+    future = [dates[-1] + timedelta(weeks=i) for i in range(1, horizon + 1)]
 
-    if not seasonal:
+    if name.endswith(PAYDAY_SUFFIX):
+        fit = fit_payday_cycle(y, dates)
+        if fit is None:
+            return None
+        # Remove the payday swings, forecast the underlying level, then put the cycle back.
+        adjusted = y / payday_multipliers(fit, dates)
+        factors = payday_multipliers(fit, future)
+        return np.maximum(0.0, base_func(adjusted, horizon) * factors), factors
+
+    base_fcst = base_func(y, horizon)
+    if not name.endswith(SEASONAL_SUFFIX):
         return np.maximum(0.0, base_fcst), np.ones(horizon)
 
-    future = [dates[-1] + timedelta(weeks=i) for i in range(1, horizon + 1)]
     factors = seasonal_factors(y, dates, future)
     if factors is None:
         return None
@@ -1107,7 +1195,7 @@ table_df = pd.DataFrame({
     "Same week LY units": ly["Sales_Units"],
     "Same week LY revenue": ly["Sales_Value"],
     "Units vs LY": np.where(matched, final_units - np.nan_to_num(ly["Sales_Units"]), np.nan),
-    "Seasonal index": season_idx,
+    "Seasonal / payday index": season_idx,
     "LY promo lift": promo_lifts,
 })
 
@@ -1123,7 +1211,7 @@ st.dataframe(
         "Forecast units": "{:,.0f}", "Range low": "{:,.0f}", "Range high": "{:,.0f}",
         "Forecast revenue": "R {:,.0f}", "Same week LY units": "{:,.0f}",
         "Same week LY revenue": "R {:,.0f}", "Units vs LY": "{:+,.0f}",
-        "Seasonal index": "{:.2f}", "LY promo lift": "{:.2f}x",
+        "Seasonal / payday index": "{:.2f}", "LY promo lift": "{:.2f}x",
     }, na_rep="-").map(_colour_gap, subset=["Units vs LY"]),
     width="stretch", hide_index=True,
 )
@@ -1148,13 +1236,16 @@ with st.expander("🏆 How the model was chosen"):
         st.dataframe(shown.style.format({"WMAPE %": "{:.1f}", "Bias %": "{:+.1f}"}),
                      width="stretch", hide_index=True)
         st.caption("WMAPE = total absolute error ÷ total actual sales. Bias above 0 means the model "
-                   "over-forecasts. Models with '52-Wk Seasonality' follow last year's weekly shape.")
+                   "over-forecasts. '52-Wk Seasonality' models follow last year's weekly shape; 'Payday Cycle' "
+                   "models learn the month-end payday/SASSA uplift from your history and apply it to the "
+                   "forecast weeks by calendar date.")
 
 with st.expander("📘 How the forecast is built"):
     st.markdown(
         f"""
 - **Forecast input:** {forecast_source}.
 - **Model:** {champion}, picked automatically for the lowest backtest error.
+- **Weekly shape:** {"month-end payday cycle learned from your history" if champion.endswith(PAYDAY_SUFFIX) else ("last year's weekly shape" if champion.endswith(SEASONAL_SUFFIX) else "none (a flat level was the most accurate)")}.
 - **Last year's promotions:** {"repeated in the forecast (baseline × last year's promo lift)" if apply_promo_repeat else "not added on top (they are already in actual sales, or switched off)"}.
 - **SA macro factor:** {macro_factor:.3f} (price increase {price_yoy:.1f}% vs food CPI {cpi_inflation:.1f}%{"" if use_macro else ", switched off"}).
 - **Revenue:** forecast units × current regular shelf price (R {rsp_now:,.2f}).
