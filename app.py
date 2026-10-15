@@ -1,3 +1,18 @@
+"""
+Unilever FMCG Demand & Recovery Planner
+=======================================
+
+What the tool does, in plain terms:
+  1. Forecasts weekly demand for 4, 8 or 12 weeks.
+  2. Tests every available forecasting model on your own history (rolling
+     backtest) and uses ONLY the model with the lowest error (WMAPE).
+  3. Compares the forecast with the same weeks last year.
+  4. If the forecast is below last year, it sizes three recovery levers
+     - Price, Promotion and Distribution - from your own data and recommends
+     the one that closes the most of the decline for the best revenue result.
+"""
+
+import math
 import warnings
 from datetime import timedelta
 
@@ -5,48 +20,19 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
 from statsmodels.tsa.forecasting.theta import ThetaModel
 from statsmodels.tsa.holtwinters import Holt, SimpleExpSmoothing
 
 
 # ============================================================
-# 1. PAGE CONFIGURATION & STYLING
+# 1. SETTINGS
 # ============================================================
-st.set_page_config(
-    page_title="Unilever FMCG Demand & Prescriptive Engine",
-    page_icon="📦",
-    layout="wide",
-)
-
-st.markdown(
-    """
-    <style>
-    .main-header {font-size: 24px; font-weight: 700; color: #1E3A8A; margin-bottom: 8px;}
-    
-    /* Reduced KPI Font Styling */
-    [data-testid="stMetricValue"] {
-        font-size: 18px !important;
-        font-weight: 600 !important;
-        color: #0F172A !important;
-    }
-    [data-testid="stMetricLabel"] {
-        font-size: 12px !important;
-        font-weight: 500 !important;
-        color: #475569 !important;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
-    }
-    [data-testid="stMetricDelta"] {
-        font-size: 12px !important;
-    }
-
-    .alert-card {padding: 16px; border: 1px solid #FCA5A5; border-radius: 8px; background: #FEF2F2; margin-bottom: 16px;}
-    .solution-box {background-color: #F0FDF4; border-left: 4px solid #16A34A; padding: 12px 16px; margin-top: 8px; border-radius: 4px;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+HORIZON_OPTIONS = [4, 8, 12]
+LY_MATCH_TOLERANCE_DAYS = 3          # weekly data: LY week must be within 3 days of t-52w
+SEASONAL_CLIP = (0.50, 1.50)         # cap the influence of an abnormal LY week
+MAX_BACKTEST_ORIGINS = 12            # rolling-origin folds per model (speed vs robustness)
+SEASONAL_SUFFIX = " + 52-Wk Seasonality"
+TIE_BAND_PCT = 10.0                  # levers within 10 pts of gap closure compete on revenue
 
 
 # ============================================================
@@ -69,18 +55,11 @@ MEASURE_SETS = {
     },
 }
 
-BASE_COLUMNS = [
-    "Full Date",
-    "Brand",
-    "Category",
-    "Product",
-    "ProductsID",
-    "Subcategory",
-]
+BASE_COLUMNS = ["Full Date", "Brand", "Category", "Product", "ProductsID", "Subcategory"]
 
 
 # ============================================================
-# 3. PREPROCESSING & FOOLPROOF SCALE ENFORCEMENT ENGINE
+# 3. PREPROCESSING & SCALE ENFORCEMENT
 # ============================================================
 def clean_number(series):
     return pd.to_numeric(series, errors="coerce")
@@ -88,28 +67,22 @@ def clean_number(series):
 
 def detect_measure_set(columns):
     columns = set(columns)
-
     m52 = MEASURE_SETS["52-week"]
-    base_52 = [m52["value"], m52["price"], m52["promo"]]
-
-    if all(c in columns for c in base_52):
+    if all(c in columns for c in [m52["value"], m52["price"], m52["promo"]]):
         if m52["baseline"] in columns:
             return "52-week", m52, None
         return "52-week-missing-baseline", m52, m52["baseline"]
 
     m26 = MEASURE_SETS["26-week"]
-    base_26 = [m26["value"], m26["price"], m26["promo"]]
-
-    if all(c in columns for c in base_26):
+    if all(c in columns for c in [m26["value"], m26["price"], m26["promo"]]):
         return "26-week", m26, None
 
     return None, None, None
 
 
 def validate_and_prepare(raw_df):
-    """Validate raw CSV extract and create clean, auto-scaled analytical fields."""
-    errors = []
-    warnings_list = []
+    """Validate the raw CSV extract and create clean, auto-scaled analytical fields."""
+    errors, warnings_list = [], []
 
     missing_base = [c for c in BASE_COLUMNS if c not in raw_df.columns]
     if missing_base:
@@ -117,60 +90,37 @@ def validate_and_prepare(raw_df):
         return False, errors, warnings_list, None, None
 
     measure_window, measures, missing_measure = detect_measure_set(raw_df.columns)
-
     if measure_window == "52-week-missing-baseline":
-        errors.append(
-            f"Required baseline column '{missing_measure}' is missing from the extract."
-        )
+        errors.append(f"Required baseline column '{missing_measure}' is missing from the extract.")
         return False, errors, warnings_list, None, None
-
     if measures is None:
         errors.append("Could not find the required sales measure columns.")
         return False, errors, warnings_list, None, None
 
     df = raw_df.copy()
 
-    # Parse Dates
     df["date_key"] = pd.to_datetime(df["Full Date"], errors="coerce")
     bad_dates = int(df["date_key"].isna().sum())
     if bad_dates:
         warnings_list.append(f"{bad_dates:,} rows have invalid dates and were removed.")
         df = df.dropna(subset=["date_key"]).copy()
-
     if df.empty:
         return False, ["No valid dated rows remain after date validation."], warnings_list, None, None
 
-    # Pricing & Revenue
     df["Sales Value"] = clean_number(df[measures["value"]]).fillna(0).clip(lower=0)
     df["Ave RSP"] = clean_number(df[measures["price"]])
     df["Promo RSP"] = clean_number(df[measures["promo"]])
 
-    # Weekly Actual Volume Units = Sales Value / Ave RSP
-    df["Sales Units"] = np.where(
-        df["Ave RSP"] > 0,
-        df["Sales Value"] / df["Ave RSP"],
-        np.nan,
-    )
+    df["Sales Units"] = np.where(df["Ave RSP"] > 0, df["Sales Value"] / df["Ave RSP"], np.nan)
     df["Sales Units"] = pd.to_numeric(df["Sales Units"], errors="coerce").fillna(0).clip(lower=0)
 
-    # Baseline & Incremental Processing
-    #
-    # The old logic guessed the baseline scale from broad ratio bands.
-    # That can accidentally interpret a value/annual field as weekly units,
-    # producing forecasts many times larger than actual demand.
+    # ---- Baseline scale detection (choose the interpretation closest to actual units)
     if measures["baseline"] is not None and measures["baseline"] in df.columns:
         raw_b = (
             clean_number(df[measures["baseline"]])
-            .replace([np.inf, -np.inf], np.nan)
-            .fillna(0)
-            .clip(lower=0)
+            .replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
         )
-
-        valid_mask = (
-            (df["Sales Units"] > 0)
-            & (df["Ave RSP"] > 0)
-            & (raw_b > 0)
-        )
+        valid_mask = (df["Sales Units"] > 0) & (df["Ave RSP"] > 0) & (raw_b > 0)
 
         if valid_mask.any():
             candidates = {
@@ -179,7 +129,6 @@ def validate_and_prepare(raw_df):
                 "weekly_value_to_units": raw_b / df["Ave RSP"],
                 "annual_value_div_52_to_units": raw_b / (52.0 * df["Ave RSP"]),
             }
-
             candidate_stats = []
             actual = df.loc[valid_mask, "Sales Units"].astype(float)
             for mode, candidate in candidates.items():
@@ -197,7 +146,6 @@ def validate_and_prepare(raw_df):
             if candidate_stats:
                 _, chosen_mode, chosen_ratio = min(candidate_stats, key=lambda x: x[0])
                 baseline_units = candidates[chosen_mode]
-
                 if chosen_mode == "weekly_value_to_units":
                     baseline_value = raw_b
                 elif chosen_mode == "annual_value_div_52_to_units":
@@ -207,7 +155,6 @@ def validate_and_prepare(raw_df):
 
                 df["Baseline Units"] = baseline_units
                 df["Baseline Value"] = baseline_value
-
                 mode_labels = {
                     "weekly_units": "source treated as weekly units",
                     "annual_units_div_52": "source treated as 52-week cumulative units and divided by 52",
@@ -216,47 +163,36 @@ def validate_and_prepare(raw_df):
                 }
                 warnings_list.append(
                     f"Baseline scaling: {mode_labels[chosen_mode]}. "
-                    f"Median Baseline/Actual ratio = {chosen_ratio:.2f}x."
+                    f"Median baseline/actual ratio = {chosen_ratio:.2f}x."
                 )
             else:
                 df["Baseline Units"] = df["Sales Units"]
                 df["Baseline Value"] = df["Sales Value"]
-                warnings_list.append("Baseline could not be reliably scaled; actual sales units are being used as the baseline.")
+                warnings_list.append("Baseline could not be reliably scaled; actual sales units are used as the baseline.")
         else:
             df["Baseline Units"] = df["Sales Units"]
             df["Baseline Value"] = df["Sales Value"]
-            warnings_list.append("Baseline had no usable overlap with actual sales; actual sales units are being used as the baseline.")
+            warnings_list.append("Baseline had no usable overlap with actual sales; actual sales units are used as the baseline.")
 
         df["Baseline Units"] = pd.to_numeric(df["Baseline Units"], errors="coerce").fillna(0).clip(lower=0)
         df["Baseline Value"] = pd.to_numeric(df["Baseline Value"], errors="coerce").fillna(0).clip(lower=0)
-
-        df["Calculated Incremental Units"] = df["Sales Units"] - df["Baseline Units"]
-
-        incremental_col = measures.get("incremental")
-        if incremental_col and incremental_col in df.columns:
-            raw_inc = clean_number(df[incremental_col]).replace([np.inf, -np.inf], np.nan)
-            df["Source Incremental Units"] = raw_inc
-            # Always use the coherent weekly calculation for downstream aggregation.
-            df["Incremental Units"] = df["Calculated Incremental Units"]
-        else:
-            df["Source Incremental Units"] = np.nan
-            df["Incremental Units"] = df["Calculated Incremental Units"]
+        df["Incremental Units"] = df["Sales Units"] - df["Baseline Units"]
     else:
-        # Fallback for 26-week extracts missing explicit baseline columns
         df["Baseline Units"] = df["Sales Units"]
         df["Baseline Value"] = df["Sales Value"]
-        df["Source Incremental Units"] = 0.0
-        df["Calculated Incremental Units"] = 0.0
         df["Incremental Units"] = 0.0
 
-    # Distribution & Dimensions
+    # ---- Distribution: never invent a value. Missing data disables the distribution lever.
     if "Numeric Distribution" in df.columns:
         dist = clean_number(df["Numeric Distribution"])
         if not dist.dropna().empty and dist.dropna().max() <= 1.0:
             dist = dist * 100
         df["Numeric Distribution"] = dist.clip(0, 100)
+        if dist.dropna().empty:
+            warnings_list.append("'Numeric Distribution' is empty; distribution recommendations are disabled.")
     else:
-        df["Numeric Distribution"] = 85.0
+        df["Numeric Distribution"] = np.nan
+        warnings_list.append("No 'Numeric Distribution' column found; distribution recommendations are disabled.")
 
     for col in ["Category", "Subcategory", "Brand", "Product"]:
         df[col] = df[col].fillna("Unknown").astype(str)
@@ -272,22 +208,42 @@ def prepare_csv(csv_bytes):
 
 
 # ============================================================
-# 4. SAFE WEEKLY AGGREGATION ENGINE
+# 4. WEEKLY AGGREGATION & PROMO-WEEK DETECTION
 # ============================================================
+def baseline_is_distinct(weekly):
+    """True when the baseline is a real measure rather than a copy of actual sales."""
+    act = weekly["Sales_Units"]
+    base = weekly["Baseline_Units"]
+    differs = (base - act).abs() > 1e-6 * act.abs().clip(lower=1)
+    return bool(differs.mean() > 0.5)
+
+
+def flag_promo_weeks(weekly):
+    """A week counts as promoted if it shows a real promo discount or a clear lift over baseline."""
+    flags = pd.Series(False, index=weekly.index)
+
+    depth = weekly["Promo_Depth_%"].where(weekly["Promo_RSP_Weighted"].notna())
+    depth = depth.fillna(weekly["Promo_Depth_%"])
+    depth_flags = (depth >= 5).fillna(False)
+    # If almost every week looks "on promo", the promo RSP field is not informative.
+    if depth.notna().sum() >= 4 and depth_flags.mean() <= 0.6:
+        flags |= depth_flags
+
+    if baseline_is_distinct(weekly):
+        lift = weekly["Sales_Units"] / weekly["Baseline_Units"].where(weekly["Baseline_Units"] > 0)
+        flags |= (lift >= 1.10).fillna(False)
+
+    return flags
+
+
 def aggregate_weekly(df):
     if df.empty:
         return pd.DataFrame()
 
     df_copy = df.copy()
-
-    # Defensively ensure required columns exist to avoid KeyErrors
     for col, default_val in [
-        ("Sales Units", 0.0),
-        ("Sales Value", 0.0),
-        ("Baseline Units", 0.0),
-        ("Baseline Value", 0.0),
-        ("Incremental Units", 0.0),
-        ("Numeric Distribution", 85.0),
+        ("Sales Units", 0.0), ("Sales Value", 0.0), ("Baseline Units", 0.0),
+        ("Baseline Value", 0.0), ("Incremental Units", 0.0), ("Numeric Distribution", np.nan),
     ]:
         if col not in df_copy.columns:
             df_copy[col] = default_val
@@ -297,7 +253,6 @@ def aggregate_weekly(df):
         .agg(
             Sales_Units=("Sales Units", "sum"),
             Baseline_Units=("Baseline Units", "sum"),
-            Incremental_Units=("Incremental Units", "sum"),
             Sales_Value=("Sales Value", "sum"),
             Baseline_Value=("Baseline Value", "sum"),
             Distribution=("Numeric Distribution", "mean"),
@@ -305,97 +260,40 @@ def aggregate_weekly(df):
         .sort_values("date_key")
         .reset_index(drop=True)
     )
-
     base["Incremental_Units"] = base["Sales_Units"] - base["Baseline_Units"]
     base["Effective_RSP"] = np.where(base["Sales_Units"] > 0, base["Sales_Value"] / base["Sales_Units"], np.nan)
 
+    base["Promo_RSP_Weighted"] = np.nan
     if "Promo RSP" in df_copy.columns:
         promo_part = df_copy.copy()
         promo_part["Promo_RSP"] = pd.to_numeric(promo_part["Promo RSP"], errors="coerce")
-        promo_part = promo_part[(promo_part["Promo_RSP"] > 0) & (promo_part["Sales Units"] > 0)].copy()
-
+        promo_part = promo_part[(promo_part["Promo_RSP"] > 0) & (promo_part["Sales Units"] > 0)]
         if not promo_part.empty:
-            promo_part["Promo_Value_Proxy"] = promo_part["Promo_RSP"] * promo_part["Sales Units"]
-            promo_week = promo_part.groupby("date_key").agg(Promo_Value_Proxy=("Promo_Value_Proxy", "sum"), Promo_Units=("Sales Units", "sum")).reset_index()
-            promo_week["Promo_RSP_Weighted"] = np.where(promo_week["Promo_Units"] > 0, promo_week["Promo_Value_Proxy"] / promo_week["Promo_Units"], np.nan)
-            base = base.merge(promo_week[["date_key", "Promo_RSP_Weighted"]], on="date_key", how="left")
-        else:
-            base["Promo_RSP_Weighted"] = np.nan
-    else:
-        base["Promo_RSP_Weighted"] = np.nan
+            promo_part = promo_part.assign(Promo_Value_Proxy=promo_part["Promo_RSP"] * promo_part["Sales Units"])
+            promo_week = promo_part.groupby("date_key").agg(
+                Promo_Value_Proxy=("Promo_Value_Proxy", "sum"), Promo_Units=("Sales Units", "sum")
+            ).reset_index()
+            promo_week["Promo_RSP_Weighted"] = np.where(
+                promo_week["Promo_Units"] > 0, promo_week["Promo_Value_Proxy"] / promo_week["Promo_Units"], np.nan
+            )
+            base = base.drop(columns="Promo_RSP_Weighted").merge(
+                promo_week[["date_key", "Promo_RSP_Weighted"]], on="date_key", how="left"
+            )
 
+    # Regular shelf price = rolling median of effective price (promo weeks are the minority,
+    # so the median ignores them). Promo depth is measured against this regular price,
+    # because the effective price in a promo week is already discounted.
+    base["Regular_RSP"] = base["Effective_RSP"].rolling(9, center=True, min_periods=3).median()
+    base["Regular_RSP"] = base["Regular_RSP"].fillna(base["Effective_RSP"])
+    promo_price = base["Promo_RSP_Weighted"].fillna(base["Effective_RSP"])
     base["Promo_Depth_%"] = np.where(
-        (base["Effective_RSP"] > 0) & base["Promo_RSP_Weighted"].notna(),
-        ((base["Effective_RSP"] - base["Promo_RSP_Weighted"]) / base["Effective_RSP"]) * 100,
+        base["Regular_RSP"] > 0,
+        (base["Regular_RSP"] - promo_price) / base["Regular_RSP"] * 100,
         np.nan,
     )
     base["Promo_Depth_%"] = base["Promo_Depth_%"].replace([np.inf, -np.inf], np.nan).clip(0, 100)
-
+    base["Promo_Week"] = flag_promo_weeks(base)
     return base
-
-
-# ============================================================
-# 5. FORECASTING MODELS & BACKTESTING
-# ============================================================
-def forecast_naive(y, horizon):
-    return np.repeat(max(0.0, float(y[-1])), horizon)
-
-def forecast_ma4(y, horizon):
-    n = min(4, len(y))
-    return np.repeat(max(0.0, float(np.mean(y[-n:]))), horizon)
-
-def forecast_ses(y, horizon):
-    if len(y) == 0 or np.nanstd(y) < 1e-10:
-        return forecast_naive(y, horizon)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        fit = SimpleExpSmoothing(y, initialization_method="estimated").fit(optimized=True)
-    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
-
-def forecast_damped_holt(y, horizon):
-    if len(y) < 5 or np.nanstd(y) < 1e-10:
-        return forecast_ses(y, horizon)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        fit = Holt(y, initialization_method="estimated", damped_trend=True).fit(optimized=True)
-    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
-
-def base_model_registry():
-    return {
-        "Naive Last Week": forecast_naive,
-        "4-Week Moving Average": forecast_ma4,
-        "Simple Exponential Smoothing": forecast_ses,
-        "Damped Holt": forecast_damped_holt,
-    }
-
-
-def run_baseline_model(series, horizon=4):
-    y = np.asarray(series, dtype=float)
-    registry = base_model_registry()
-    best_model = "4-Week Moving Average"
-    best_wmape = float("inf")
-    
-    min_train = 16 if len(y) >= 24 else 8
-    if len(y) > min_train + horizon:
-        for name, func in registry.items():
-            errors, actuals = [], []
-            for split in range(min_train, len(y) - horizon + 1):
-                train, actual = y[:split], y[split : split + horizon]
-                try:
-                    pred = func(train, horizon)
-                    errors.extend(np.abs(pred - actual))
-                    actuals.extend(actual)
-                except Exception:
-                    continue
-            if actuals and np.sum(actuals) > 0:
-                wmape_val = (np.sum(errors) / np.sum(actuals)) * 100
-                if wmape_val < best_wmape:
-                    best_wmape = wmape_val
-                    best_model = name
-
-    model_func = registry.get(best_model, forecast_ma4)
-    forecast_vals = np.maximum(0.0, model_func(y, horizon))
-    return forecast_vals, best_model, best_wmape
 
 
 def choose_forecast_series(weekly):
@@ -403,619 +301,864 @@ def choose_forecast_series(weekly):
     actual = pd.to_numeric(weekly["Sales_Units"], errors="coerce").fillna(0)
     baseline = pd.to_numeric(weekly["Baseline_Units"], errors="coerce").fillna(0)
 
+    if not baseline_is_distinct(weekly):
+        return actual.values, "Actual Sales Units", np.nan
+
     mask = (actual > 0) & (baseline > 0)
     if mask.sum() < 8:
-        return actual.values, "Actual Sales Units", np.nan
+        return actual.values, "Actual Sales Units (baseline rejected)", np.nan
 
     ratio = (baseline[mask] / actual[mask]).replace([np.inf, -np.inf], np.nan).dropna()
     median_ratio = float(ratio.median()) if not ratio.empty else np.nan
-
     if np.isfinite(median_ratio) and 0.40 <= median_ratio <= 3.00:
         return baseline.values, "Baseline Units", median_ratio
-
     return actual.values, "Actual Sales Units (baseline rejected)", median_ratio
 
 
 # ============================================================
-# 6. 52-WEEK SEASONALITY + PROMOTIONAL OVERLAY & SA MACRO ELASTICITY
+# 5. FORECASTING MODELS, SEASONALITY & CHAMPION SELECTION
 # ============================================================
-def apply_52wk_promo_overlay_and_sa_macro(
-    weekly,
-    future_dates,
-    base_volume_fcst,
-    price_yoy,
-    cpi_inflation,
-    elasticity,
-    apply_promo_overlay=True,
-):
+def _flat(value, horizon):
+    return np.repeat(max(0.0, float(value)), horizon)
+
+
+def forecast_naive(y, horizon):
+    return _flat(y[-1], horizon)
+
+
+def forecast_ma4(y, horizon):
+    return _flat(np.mean(y[-min(4, len(y)):]), horizon)
+
+
+def forecast_ses(y, horizon):
+    if len(y) < 3 or np.nanstd(y) < 1e-10:
+        return forecast_naive(y, horizon)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = SimpleExpSmoothing(y, initialization_method="estimated").fit(optimized=True)
+    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
+
+
+def forecast_damped_holt(y, horizon):
+    if len(y) < 6 or np.nanstd(y) < 1e-10:
+        return forecast_ses(y, horizon)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = Holt(y, initialization_method="estimated", damped_trend=True).fit(optimized=True)
+    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
+
+
+def forecast_theta(y, horizon):
+    if len(y) < 8 or np.nanstd(y) < 1e-10:
+        return forecast_ses(y, horizon)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        fit = ThetaModel(np.asarray(y, dtype=float), period=1, deseasonalize=False).fit()
+    return np.maximum(0.0, np.asarray(fit.forecast(horizon), dtype=float))
+
+
+BASE_MODELS = {
+    "Naive Last Week": forecast_naive,
+    "4-Week Moving Average": forecast_ma4,
+    "Simple Exponential Smoothing": forecast_ses,
+    "Damped Holt": forecast_damped_holt,
+    "Theta": forecast_theta,
+}
+
+
+def candidate_names():
+    """Every base model is tested with and without a 52-week seasonal index."""
+    names = []
+    for base_name in BASE_MODELS:
+        names += [base_name, base_name + SEASONAL_SUFFIX]
+    return names
+
+
+def _value_near(series_by_date, target, tol_days=LY_MATCH_TOLERANCE_DAYS):
+    """Value of a date-indexed series at the date closest to target (within tolerance)."""
+    if series_by_date is None or series_by_date.empty:
+        return np.nan
+    target = pd.Timestamp(target)
+    pos = series_by_date.index.get_indexer([target], method="nearest")[0]
+    if pos < 0 or abs((series_by_date.index[pos] - target).days) > tol_days:
+        return np.nan
+    value = series_by_date.iloc[pos]
+    return float(value) if pd.notna(value) else np.nan
+
+
+def seasonal_factors(y, dates, future_dates, anchor_weeks=4):
     """
-    Final forecast logic:
-
-        Base Forecast
-        × 52-Week Seasonal Index
-        × Promotional Lift
-        × SA Macro Factor
-
-    Seasonality uses the prior-year baseline for the matching week
-    relative to the historical median weekly baseline.
-
-    Promotional lift uses LY Actual / LY Baseline.
-
-    This keeps seasonality and promotion as separate effects and avoids
-    adding LY sales directly to the forecast.
+    52-week seasonal index relative to *now*:
+        LY value of the target week / LY average of the last `anchor_weeks` history weeks.
+    Level models (naive, MA, SES...) forecast today's level; this index moves that level
+    along last year's seasonal shape. Returns None when there is not enough history.
     """
+    hist = pd.Series(np.asarray(y, dtype=float), index=pd.DatetimeIndex(dates))
+    hist = hist.rolling(3, center=True, min_periods=1).median()  # damp one-off spikes
 
-    adjusted_fcst_units = []
-    promo_lift_factors = []
-    ly_benchmark_units = []
-    ly_benchmark_values = []
-    seasonal_factors = []
+    anchors = [_value_near(hist, d - timedelta(weeks=52)) for d in list(hist.index[-anchor_weeks:])]
+    anchors = [a for a in anchors if np.isfinite(a) and a > 0]
+    if len(anchors) < 2:
+        return None
+    reference = float(np.mean(anchors))
 
-    # Historical reference level used to calculate the seasonal index.
-    baseline_series = (
-        pd.to_numeric(weekly["Baseline_Units"], errors="coerce")
-        .replace([np.inf, -np.inf], np.nan)
-        .dropna()
-    )
-    baseline_series = baseline_series[baseline_series > 0]
-
-    if not baseline_series.empty:
-        baseline_reference = float(baseline_series.median())
-    else:
-        # If there is no usable baseline, use historical actuals as the
-        # seasonal reference.
-        actual_series = (
-            pd.to_numeric(weekly["Sales_Units"], errors="coerce")
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna()
-        )
-        actual_series = actual_series[actual_series > 0]
-        baseline_reference = float(actual_series.median()) if not actual_series.empty else 0.0
-
-    # SA macro adjustment.
-    net_price_squeeze = max(0.0, price_yoy - cpi_inflation)
-    macro_factor = float(
-        np.clip(
-            1.0 + (elasticity * (net_price_squeeze / 100.0)),
-            0.5,
-            1.5,
-        )
-    )
-
-    for idx, f_date in enumerate(future_dates):
-        target_ly_date = f_date - timedelta(weeks=52)
-        dist = (weekly["date_key"] - target_ly_date).abs().dt.days
-        closest_idx = dist.idxmin()
-
-        seasonal_factor = 1.0
-        lift_factor = 1.0
-        ly_act_units = np.nan
-        ly_act_value = np.nan
-
-        # Match the future week to the closest LY week.
-        if dist.loc[closest_idx] <= 7:
-            ly_act_units = float(weekly.loc[closest_idx, "Sales_Units"])
-            ly_act_value = float(weekly.loc[closest_idx, "Sales_Value"])
-            ly_base_units = float(weekly.loc[closest_idx, "Baseline_Units"])
-
-            # --------------------------------------------------------
-            # 1. 52-week seasonal index
-            # --------------------------------------------------------
-            if ly_base_units > 0 and baseline_reference > 0:
-                seasonal_factor = ly_base_units / baseline_reference
-
-                # Cap the influence of an abnormal LY week.
-                seasonal_factor = float(
-                    np.clip(seasonal_factor, 0.50, 1.50)
-                )
-
-            # --------------------------------------------------------
-            # 2. Promotional lift
-            # --------------------------------------------------------
-            if ly_base_units > 0:
-                raw_lift = ly_act_units / ly_base_units
-
-                if apply_promo_overlay and 0.50 <= raw_lift <= 3.00:
-                    lift_factor = max(1.0, raw_lift)
-
-        seasonal_factors.append(seasonal_factor)
-        promo_lift_factors.append(lift_factor)
-        ly_benchmark_units.append(
-            ly_act_units if pd.notna(ly_act_units) else np.nan
-        )
-        ly_benchmark_values.append(
-            ly_act_value if pd.notna(ly_act_value) else np.nan
-        )
-
-        # ------------------------------------------------------------
-        # Final forecast
-        # ------------------------------------------------------------
-        adj_units = float(base_volume_fcst[idx]) * seasonal_factor * macro_factor
-
-        # Only apply promo lift when the forecast is based on a validated
-        # baseline. For an actual-sales forecast, promotion is already part
-        # of the historical demand signal and should not be added again.
-        if apply_promo_overlay:
-            adj_units *= lift_factor
-
-        adjusted_fcst_units.append(max(0.0, float(adj_units)))
-
-    return (
-        np.array(adjusted_fcst_units),
-        promo_lift_factors,
-        ly_benchmark_units,
-        ly_benchmark_values,
-        seasonal_factors,
-        macro_factor,
-    )
+    factors = []
+    for d in future_dates:
+        ly_val = _value_near(hist, d - timedelta(weeks=52))
+        if np.isfinite(ly_val) and ly_val > 0:
+            factors.append(float(np.clip(ly_val / reference, *SEASONAL_CLIP)))
+        else:
+            factors.append(1.0)
+    return np.array(factors)
 
 
-# ============================================================
-# 7. PRESCRIPTIVE RECOMMENDATION ENGINE
-# ============================================================
-def generate_gap_closing_recommendations(
-    scope_name, fcst_units, ly_units, fcst_value, ly_value,
-    avg_rsp, promo_rsp, num_dist, brand_name
-):
-    """Compare forecast with matched LY actuals; avoid unvalidated uplift claims."""
-    unit_gap = fcst_units - ly_units
-    unit_gap_pct = (unit_gap / ly_units) * 100 if ly_units > 0 else np.nan
-    value_gap = fcst_value - ly_value
-    revenue_at_risk = max(0.0, -value_gap)
-    actions = []
+def predict_candidate(name, y, dates, horizon):
+    """Forecast with one candidate. Returns (forecast, seasonal_factors) or None if not possible."""
+    y = np.asarray(y, dtype=float)
+    dates = pd.DatetimeIndex(dates)
+    seasonal = name.endswith(SEASONAL_SUFFIX)
+    base_fcst = BASE_MODELS[name.replace(SEASONAL_SUFFIX, "")](y, horizon)
 
-    if unit_gap < 0:
-        promo_text = f"R {promo_rsp:,.2f}" if pd.notna(promo_rsp) else "not available"
-        actions.append({
-            "type": "Pricing & Promotion",
-            "title": "Evaluate a price/promotion recovery scenario",
-            "detail": (
-                f"The forecast is {abs(unit_gap):,.0f} units below the matched prior-year period. "
-                f"Current effective RSP is R {avg_rsp:,.2f}; latest observed promo RSP is {promo_text}. "
-                "Test several price points against historical promotional weeks and validate the "
-                "incremental volume response before committing trade spend. No uplift is assumed here."
-            )
-        })
-        actions.append({
-            "type": "Payday & SASSA Timing",
-            "title": "Check promotional timing against payday and SASSA dates",
-            "detail": (
-                "Compare the forecast weeks with actual payday/SASSA payment dates and prior-year "
-                "weekly sales. Shift timing only where your own EPOS history shows a repeatable uplift."
-            )
-        })
-        if pd.notna(num_dist) and num_dist < 85.0:
-            actions.append({
-                "type": "Distribution",
-                "title": f"Investigate distribution gap (latest numeric distribution: {num_dist:.1f}%)",
-                "detail": (
-                    "Review distribution and availability by customer/account, including out-of-stocks "
-                    "and lost listings. Quantify the opportunity from store/SKU-level data before "
-                    "assigning a recoverable-unit estimate."
-                )
-            })
-        if any(k in str(brand_name).lower() or k in str(scope_name).lower() for k in ["rexona", "shield"]):
-            actions.append({
-                "type": "Brand Execution",
-                "title": "Check shelf execution and brand navigation",
-                "detail": "Review store-level availability, shelf visibility and any brand-transition issues before assigning a sales impact."
-            })
-    else:
-        actions.append({
-            "type": "Forecast Monitoring",
-            "title": "Protect the forecasted performance",
-            "detail": (
-                f"The forecast is at or above the matched prior-year volume by {unit_gap:,.0f} units. "
-                "Monitor distribution, price and promotional execution to check that forecast assumptions remain valid."
-            )
-        })
+    if not seasonal:
+        return np.maximum(0.0, base_fcst), np.ones(horizon)
+
+    future = [dates[-1] + timedelta(weeks=i) for i in range(1, horizon + 1)]
+    factors = seasonal_factors(y, dates, future)
+    if factors is None:
+        return None
+    return np.maximum(0.0, base_fcst * factors), factors
+
+
+@st.cache_data(show_spinner=False)
+def select_best_model(y_tuple, dates_tuple, horizon):
+    """
+    Rolling-origin backtest at the chosen horizon. Every eligible model is scored on the
+    SAME folds; the one with the lowest WMAPE wins (ties broken by smaller bias).
+    """
+    y = np.asarray(y_tuple, dtype=float)
+    dates = pd.DatetimeIndex(dates_tuple)
+    n = len(y)
+    min_train = max(8, min(26, n // 2))
+    origins = list(range(min_train, n - horizon + 1))[-MAX_BACKTEST_ORIGINS:]
+
+    fallback = {
+        "champion": "4-Week Moving Average",
+        "wmape": np.nan,
+        "leaderboard": pd.DataFrame(),
+        "ratio_q": None,
+        "n_folds": 0,
+        "weeks_needed": min_train + horizon + 2,
+    }
+    if len(origins) < 3:
+        return fallback
+
+    folds = {}
+    for name in candidate_names():
+        folds[name] = {}
+        for o in origins:
+            try:
+                out = predict_candidate(name, y[:o], dates[:o], horizon)
+            except Exception:
+                out = None
+            if out is not None:
+                folds[name][o] = (out[0], y[o:o + horizon])
+
+    # Keep a common fold set so every model is judged on identical weeks.
+    min_folds = min(6, len(origins))
+    eligible = [nm for nm in folds if len(folds[nm]) >= min_folds]
+
+    def common_of(names):
+        common = set(origins)
+        for nm in names:
+            common &= set(folds[nm])
+        return common
+
+    common = common_of(eligible)
+    while eligible and len(common) < min_folds:
+        eligible.remove(min(eligible, key=lambda nm: len(folds[nm])))
+        common = common_of(eligible)
+
+    rows, pooled = [], {}
+    for nm in eligible:
+        preds = np.concatenate([folds[nm][o][0] for o in sorted(common)])
+        acts = np.concatenate([folds[nm][o][1] for o in sorted(common)])
+        if acts.sum() <= 0:
+            continue
+        wmape = np.abs(preds - acts).sum() / acts.sum() * 100
+        bias = (preds.sum() - acts.sum()) / acts.sum() * 100
+        rows.append({"Model": nm, "WMAPE %": wmape, "Bias %": bias, "Backtest folds": len(common)})
+        pooled[nm] = (preds, acts)
+
+    if not rows:
+        return fallback
+
+    board = pd.DataFrame(rows)
+    board["_abs_bias"] = board["Bias %"].abs()
+    board = board.sort_values(["WMAPE %", "_abs_bias"]).drop(columns="_abs_bias").reset_index(drop=True)
+    champion = board.loc[0, "Model"]
+
+    # Empirical 80% range from the champion's own backtest misses.
+    preds, acts = pooled[champion]
+    ok = preds > 0
+    ratios = acts[ok] / preds[ok]
+    ratio_q = (float(np.quantile(ratios, 0.10)), float(np.quantile(ratios, 0.90))) if len(ratios) >= 8 else None
 
     return {
-        "unit_deficit": max(0.0, -unit_gap),
-        "unit_gap": unit_gap,
-        "unit_deficit_pct": max(0.0, -unit_gap_pct) if pd.notna(unit_gap_pct) else np.nan,
-        "unit_variance_pct": unit_gap_pct,
-        "value_gap": value_gap,
-        "revenue_at_risk": revenue_at_risk,
-        "actions": actions
+        "champion": champion,
+        "wmape": float(board.loc[0, "WMAPE %"]),
+        "leaderboard": board,
+        "ratio_q": ratio_q,
+        "n_folds": len(common),
+        "weeks_needed": min_train + horizon + 2,
     }
 
-# ============================================================
-# 8. STREAMLIT APP LAYOUT & SIDEBAR FILTERS
-# ============================================================
-st.markdown('<div class="main-header">Unilever FMCG Demand & Prescriptive Forecasting Engine</div>', unsafe_allow_html=True)
 
+# ============================================================
+# 6. LAST-YEAR BENCHMARK, PROMO REPEAT & SA MACRO ADJUSTMENT
+# ============================================================
+def ly_benchmarks(weekly, future_dates):
+    """Same week last year (t-52w) for each forecast week."""
+    indexed = weekly.set_index("date_key").sort_index()
+    cols = ["Sales_Units", "Sales_Value", "Baseline_Units", "Distribution", "Promo_Week"]
+    out = {c: [] for c in cols}
+    out["LY_Date"] = []
+    for d in future_dates:
+        target = d - timedelta(weeks=52)
+        for c in cols:
+            out[c].append(_value_near(indexed[c].astype(float), target))
+        out["LY_Date"].append(target)
+    return {k: (np.array(v, dtype=float) if k != "LY_Date" else v) for k, v in out.items()}
+
+
+def apply_overlays(model_fcst, ly, apply_promo_repeat, use_macro, price_yoy, cpi_inflation, elasticity):
+    """
+    Final forecast = champion model forecast (already seasonal if the champion uses seasonality)
+                     x last year's promo lift (only when forecasting baseline)
+                     x SA macro factor (price increase above CPI).
+    """
+    lifts = np.ones(len(model_fcst))
+    if apply_promo_repeat:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            raw = ly["Sales_Units"] / np.where(ly["Baseline_Units"] > 0, ly["Baseline_Units"], np.nan)
+        lifts = np.where(np.isfinite(raw) & (raw >= 1.0) & (raw <= 3.0), raw, 1.0)
+
+    squeeze = max(0.0, price_yoy - cpi_inflation)
+    macro = float(np.clip(1.0 + elasticity * squeeze / 100.0, 0.5, 1.5)) if use_macro else 1.0
+    return np.maximum(0.0, model_fcst * lifts * macro), lifts, macro
+
+
+def current_rsp(weekly):
+    """Regular (non-promo) shelf price from recent weeks, so a promo week doesn't distort revenue."""
+    recent = weekly.tail(8)
+    regular = recent.loc[~recent["Promo_Week"] & (recent["Effective_RSP"] > 0), "Effective_RSP"]
+    if len(regular) >= 2:
+        return float(regular.tail(4).median())
+    if weekly["Regular_RSP"].notna().any():
+        return float(weekly["Regular_RSP"].dropna().iloc[-1])
+    valid = weekly.loc[weekly["Effective_RSP"] > 0, "Effective_RSP"]
+    return float(valid.tail(4).median()) if not valid.empty else np.nan
+
+
+# ============================================================
+# 7. RECOVERY ENGINE: PRICE vs PROMOTION vs DISTRIBUTION
+# ============================================================
+def estimate_elasticity(weekly, fallback):
+    """
+    Shelf-price elasticity from NON-promo weeks (promo weeks mix price with display and
+    feature effects). The regression controls for trend and annual seasonality so that a
+    price rise that simply coincides with a declining trend is not mistaken for price
+    response. Falls back to the user's setting when the estimate isn't trustworthy.
+    """
+    w = weekly[(weekly["Sales_Units"] > 0) & (weekly["Effective_RSP"] > 0) & ~weekly["Promo_Week"]]
+    if len(w) < 20:
+        return fallback, "your setting (not enough regular-price weeks to estimate)"
+
+    t = (w["date_key"] - w["date_key"].min()).dt.days.values / 7.0
+    controls = np.column_stack([np.ones(len(w)), t, np.sin(2 * np.pi * t / 52), np.cos(2 * np.pi * t / 52)])
+    log_p, log_q = np.log(w["Effective_RSP"].values), np.log(w["Sales_Units"].values)
+
+    # Price must move independently of trend/season for the effect to be identifiable.
+    p_resid = log_p - controls @ np.linalg.lstsq(controls, log_p, rcond=None)[0]
+    if np.std(p_resid) < 0.01:
+        return fallback, "your setting (price only moved with the trend, so its effect can't be isolated)"
+
+    X = np.column_stack([controls, log_p])
+    coef, *_ = np.linalg.lstsq(X, log_q, rcond=None)
+    resid = log_q - X @ coef
+    dof = max(1, len(w) - X.shape[1])
+    sigma2 = resid @ resid / dof
+    try:
+        se = math.sqrt(sigma2 * np.linalg.inv(X.T @ X)[-1, -1])
+    except np.linalg.LinAlgError:
+        return fallback, "your setting (the data estimate was not reliable)"
+    slope = float(coef[-1])
+    if -3.0 <= slope <= -0.2 and se > 0 and abs(slope / se) >= 2:
+        return slope, f"estimated from your regular-price weeks (±{1.96 * se:.2f})"
+    return fallback, "your setting (the data estimate was not reliable)"
+
+
+def historical_promo_response(weekly):
+    """Typical promo lift and discount depth measured from your own promoted weeks."""
+    flags = weekly["Promo_Week"]
+    promo = weekly[flags & (weekly["Sales_Units"] > 0)]
+    regular = weekly[~flags & (weekly["Sales_Units"] > 0)]
+    if len(promo) < 2 or len(regular) < 4:
+        return None
+
+    if baseline_is_distinct(weekly):
+        ratio = promo["Sales_Units"] / promo["Baseline_Units"].where(promo["Baseline_Units"] > 0)
+        lift = float(ratio.replace([np.inf, -np.inf], np.nan).dropna().median())
+        method = "promo-week sales vs baseline"
+    else:
+        lift = float(promo["Sales_Units"].median() / regular["Sales_Units"].median())
+        method = "promo-week sales vs regular weeks"
+
+    depth_obs = promo["Promo_Depth_%"].dropna()
+    depth = float(depth_obs.median()) if len(depth_obs) >= 2 else np.nan
+
+    if not np.isfinite(lift) or not (1.03 <= lift <= 4.0) or not np.isfinite(depth) or depth < 1:
+        return None
+    return {"lift": lift, "depth": float(np.clip(depth, 0, 60)), "n_weeks": int(len(promo)), "method": method}
+
+
+def sku_distribution_gaps(df, last_date, top_n=5):
+    """SKUs whose numeric distribution today is below the same week last year."""
+    d = df.dropna(subset=["Numeric Distribution"])
+    if d.empty:
+        return pd.DataFrame()
+    ly_date = last_date - timedelta(weeks=52)
+    rows = []
+    for prod, grp in d.groupby("Product"):
+        s = grp.groupby("date_key")["Numeric Distribution"].mean().sort_index()
+        now, ly = _value_near(s, last_date), _value_near(s, ly_date)
+        if np.isfinite(now) and np.isfinite(ly) and ly - now >= 1:
+            rows.append({"SKU": prod, "Distribution LY %": ly, "Distribution now %": now, "Points lost": ly - now})
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("Points lost", ascending=False).head(top_n)
+
+
+def _unavailable(lever, reason):
+    return {"lever": lever, "available": False, "units": 0.0, "closure": 0.0,
+            "net_rev": 0.0, "action": "-", "why": reason}
+
+
+def evaluate_price_lever(gap, fcst_units, rsp, elasticity, elasticity_source, max_cut_pct, n_weeks, squeeze):
+    eps = abs(elasticity)
+    if fcst_units <= 0 or rsp <= 0 or eps < 0.05:
+        return _unavailable("Price", "Price response could not be measured.")
+
+    needed = gap / (fcst_units * eps)               # %ΔQ ≈ ε × %ΔP
+    cut = min(needed, max_cut_pct / 100.0)
+    recovered = min(gap, fcst_units * eps * cut)
+    new_rsp = rsp * (1 - cut)
+    net_rev = (fcst_units + recovered) * new_rsp - fcst_units * rsp
+
+    why = (f"Each 1% off the shelf price adds about {eps:.1f}% volume "
+           f"(elasticity {elasticity:.2f}, {elasticity_source}).")
+    if squeeze > 0:
+        why += f" Your price increase is running {squeeze:.1f} pts ahead of food CPI, which is part of the decline."
+    if needed > cut:
+        why += f" Closing the full gap would need a {needed * 100:.1f}% cut, above your {max_cut_pct:.0f}% limit."
+
+    return {
+        "lever": "Price", "available": True, "units": recovered,
+        "closure": recovered / gap * 100, "net_rev": net_rev,
+        "action": (f"Reduce the shelf price by {cut * 100:.1f}% "
+                   f"(R {rsp:,.2f} → R {new_rsp:,.2f}) for the {n_weeks} forecast weeks."),
+        "why": why,
+    }
+
+
+def evaluate_promo_lever(gap, fcst_weekly, shortfall_weekly, matched, overlay_lifts,
+                         future_dates, rsp, promo_resp, max_promo_weeks):
+    if promo_resp is None:
+        return _unavailable("Promotion", "Not enough promoted weeks in the history to measure a promo response.")
+    if max_promo_weeks < 1:
+        return _unavailable("Promotion", "Promotion weeks are capped at zero in the settings.")
+
+    lift, depth = promo_resp["lift"], promo_resp["depth"]
+    # Only weeks not already carrying last year's promo, biggest shortfall first.
+    candidates = [i for i in range(len(fcst_weekly))
+                  if matched[i] and overlay_lifts[i] <= 1.0001 and fcst_weekly[i] > 0]
+    candidates.sort(key=lambda i: -shortfall_weekly[i])
+    if not candidates:
+        return _unavailable("Promotion", "Every forecast week already carries last year's promotion.")
+
+    chosen, recovered, net_rev = [], 0.0, 0.0
+    for i in candidates:
+        if recovered >= gap or len(chosen) >= max_promo_weeks:
+            break
+        chosen.append(i)
+        recovered += fcst_weekly[i] * (lift - 1)
+        net_rev += fcst_weekly[i] * lift * rsp * (1 - depth / 100) - fcst_weekly[i] * rsp
+    recovered = min(recovered, gap)
+
+    weeks_txt = ", ".join(future_dates[i].strftime("%d %b") for i in sorted(chosen))
+    promo_price = rsp * (1 - depth / 100)
+    return {
+        "lever": "Promotion", "available": True, "units": recovered,
+        "closure": recovered / gap * 100, "net_rev": net_rev,
+        "action": (f"Run {len(chosen)} promo week(s) at about {depth:.0f}% off "
+                   f"(R {promo_price:,.2f}) in the weeks starting {weeks_txt}."),
+        "why": (f"Your past promotions lifted volume about {lift:.2f}x at a {depth:.0f}% discount "
+                f"({promo_resp['n_weeks']} promoted weeks, {promo_resp['method']}). "
+                "Weeks with the biggest shortfall against last year are targeted first."),
+    }
+
+
+def evaluate_distribution_lever(gap, fcst_units, weekly, ly, matched, rsp, sku_gaps):
+    dist = weekly["Distribution"].dropna()
+    if dist.empty:
+        return _unavailable("Distribution", "No numeric distribution data in the extract.")
+
+    current = float(dist.iloc[-1])
+    ly_dist = float(np.nanmean(ly["Distribution"][matched])) if np.isfinite(ly["Distribution"][matched]).any() else np.nan
+    recent_best = float(dist.tail(13).max())
+    target = float(np.nanmax([ly_dist, recent_best]))
+    points = target - current
+    if current <= 0 or points < 1:
+        return _unavailable(
+            "Distribution",
+            f"Distribution ({current:.1f}%) is already at or above last year and its recent best; no gap to recover.",
+        )
+
+    recovered = min(gap, fcst_units / current * points)  # volume scales with stores stocking
+    why = (f"Numeric distribution is {current:.1f}% vs {ly_dist:.1f}% in the same weeks last year "
+           f"(recent best {recent_best:.1f}%). Volume is assumed to scale with the share of stores stocking.")
+    if not sku_gaps.empty:
+        why += " Biggest losses: " + "; ".join(
+            f"{r.SKU} ({r['Points lost']:.1f} pts)" for _, r in sku_gaps.head(3).iterrows()
+        ) + "."
+    return {
+        "lever": "Distribution", "available": True, "units": recovered,
+        "closure": recovered / gap * 100, "net_rev": recovered * rsp,
+        "action": (f"Restore numeric distribution from {current:.1f}% to {target:.1f}% "
+                   f"(+{points:.1f} pts): fix out-of-stocks and regain lost listings."),
+        "why": why,
+    }
+
+
+def rank_levers(levers):
+    """
+    Best lever = the one that closes the most of the decline. When two levers close a
+    similar share (within TIE_BAND_PCT points), the one with the better revenue result wins.
+    """
+    usable = [lv for lv in levers if lv["available"] and lv["units"] > 0]
+    if not usable:
+        return None, None
+    usable.sort(key=lambda lv: (-lv["closure"], -lv["net_rev"]))
+    best = usable[0]
+    for lv in usable[1:]:
+        if lv["closure"] >= best["closure"] - TIE_BAND_PCT and lv["net_rev"] > best["net_rev"]:
+            best = lv
+
+    support = None
+    if best["closure"] < 95:
+        remaining = (100 - best["closure"])
+        others = [lv for lv in usable if lv is not best]
+        if others:
+            support = max(others, key=lambda lv: (min(lv["closure"], remaining), lv["net_rev"]))
+    return best, support
+
+
+# ============================================================
+# 8. PAGE SETUP & STYLING
+# ============================================================
+st.set_page_config(page_title="Unilever Demand & Recovery Planner", page_icon="📦", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .main-header {font-size: 26px; font-weight: 700; color: #1F36C7; margin-bottom: 2px;}
+    .sub-header {font-size: 14px; color: #475569; margin-bottom: 14px;}
+    [data-testid="stMetricValue"] {font-size: 20px !important; font-weight: 600 !important; color: #0F172A !important;}
+    [data-testid="stMetricLabel"] {font-size: 13px !important; color: #475569 !important;}
+    .verdict {padding: 16px 20px; border-radius: 8px; margin: 6px 0 16px 0;}
+    .verdict h4 {margin: 0 0 4px 0;}
+    .verdict p {margin: 0; font-size: 14px;}
+    .verdict-bad {background: #FEF2F2; border: 1px solid #FCA5A5;}
+    .verdict-bad h4 {color: #991B1B;} .verdict-bad p {color: #7F1D1D;}
+    .verdict-good {background: #F0FDF4; border: 1px solid #86EFAC;}
+    .verdict-good h4 {color: #166534;} .verdict-good p {color: #14532D;}
+    .rec-primary {background: #EEF2FF; border-left: 5px solid #1F36C7; padding: 14px 18px; border-radius: 4px; margin-bottom: 10px;}
+    .rec-support {background: #F8FAFC; border-left: 5px solid #94A3B8; padding: 12px 18px; border-radius: 4px; margin-bottom: 10px;}
+    .rec-lever {font-size: 13px; color: #475569; margin-bottom: 2px;}
+    .rec-action {font-size: 16px; font-weight: 600; color: #0F172A; margin-bottom: 6px;}
+    .rec-why {font-size: 14px; color: #334155;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown('<div class="main-header">Unilever Demand & Recovery Planner</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">Forecast the next 4, 8 or 12 weeks, compare with the same weeks last year, '
+    "and get the best price, promotion or distribution action to close any decline.</div>",
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# 9. SIDEBAR: UPLOAD, FILTERS, HORIZON, SETTINGS
+# ============================================================
 with st.sidebar:
-    st.header("📥 Data Management")
-    uploaded_file = st.file_uploader("Upload Weekly Sales CSV", type=["csv"])
+    st.header("1. Upload data")
+    uploaded_file = st.file_uploader("Weekly sales CSV", type=["csv"])
 
 if uploaded_file is None:
-    st.info("👈 Upload your Unilever sales CSV extract in the left sidebar to start.")
+    st.info("Upload your weekly sales CSV in the sidebar to start. "
+            "At least 52 weeks of history is needed for last-year comparisons; 60+ weeks gives the best results.")
     st.stop()
 
 try:
-    csv_bytes = uploaded_file.getvalue()
-    valid, errors, warning_list, df_clean, measure_window = prepare_csv(csv_bytes)
+    valid, errors, warning_list, df_clean, measure_window = prepare_csv(uploaded_file.getvalue())
 except Exception as exc:
     st.error(f"Could not read the uploaded CSV file: {exc}")
     st.stop()
 
 if not valid:
-    st.error("Schema validation failed.")
+    st.error("The file doesn't match the expected format.")
     for e in errors:
         st.write(f"- {e}")
     st.stop()
 
-for warning in warning_list:
-    st.sidebar.warning(warning)
-
-
-# Sidebar Filters & SA Macro Controls
 with st.sidebar:
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🇿🇦 SA Macroeconomic Controls")
-    
-    price_yoy = st.sidebar.number_input("Unilever YoY RSP Increase (%)", min_value=0.0, max_value=30.0, value=8.5, step=0.5)
-    cpi_inflation = st.sidebar.number_input("SA Food CPI Inflation (%)", min_value=0.0, max_value=30.0, value=5.2, step=0.5)
-    elasticity = st.sidebar.slider("Price Elasticity Coefficient (ε)", min_value=-2.5, max_value=-0.1, value=-1.1, step=0.1)
-    
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🔍 Hierarchy Filters")
-
+    st.header("2. Choose what to forecast")
     categories = ["All"] + sorted(df_clean["Category"].unique().tolist())
-    category = st.selectbox("1. Category", categories)
+    category = st.selectbox("Category", categories)
     d1 = df_clean if category == "All" else df_clean[df_clean["Category"] == category]
 
     subcategories = ["All"] + sorted(d1["Subcategory"].unique().tolist())
-    subcategory = st.selectbox("2. Subcategory", subcategories)
+    subcategory = st.selectbox("Subcategory", subcategories)
     d2 = d1 if subcategory == "All" else d1[d1["Subcategory"] == subcategory]
 
     brands = ["All"] + sorted(d2["Brand"].unique().tolist())
-    brand = st.selectbox("3. Brand", brands)
+    brand = st.selectbox("Brand", brands)
     d3 = d2 if brand == "All" else d2[d2["Brand"] == brand]
 
     product_options = ["All"] + sorted(d3["Product"].unique().tolist())
-    selected_products = st.multiselect("4. Product SKU(s)", options=product_options, default=["All"])
+    selected_products = st.multiselect("Product SKU(s)", options=product_options, default=["All"])
 
     if "All" in selected_products or not selected_products:
         final_df = d3.copy()
-        product_label = f"All Products in {brand if brand != 'All' else 'Portfolio'}"
+        product_label = f"All products in {brand if brand != 'All' else 'portfolio'}"
     else:
         final_df = d3[d3["Product"].isin(selected_products)].copy()
-        product_label = selected_products[0] if len(selected_products) == 1 else f"{len(selected_products)} Selected SKUs"
+        product_label = selected_products[0] if len(selected_products) == 1 else f"{len(selected_products)} selected SKUs"
 
-    forecast_horizon = st.slider("Forecast Horizon (Weeks)", min_value=1, max_value=8, value=4)
+    st.header("3. Forecast horizon")
+    forecast_horizon = st.radio(
+        "Weeks to forecast", HORIZON_OPTIONS, index=0, horizontal=True,
+        format_func=lambda w: f"{w} weeks", label_visibility="collapsed",
+    )
+
+    with st.expander("⚙️ Advanced settings"):
+        st.markdown("**SA macro adjustment**")
+        use_macro = st.checkbox("Adjust for price increase above CPI", value=True,
+                                help="Reduces the forecast when your price increase outpaces food inflation.")
+        price_yoy = st.number_input("Unilever YoY price increase (%)", 0.0, 30.0, 8.5, 0.5, disabled=not use_macro)
+        cpi_inflation = st.number_input("SA food CPI inflation (%)", 0.0, 30.0, 5.2, 0.5, disabled=not use_macro)
+        elasticity_input = st.slider("Price elasticity (fallback)", -2.5, -0.1, -1.1, 0.1,
+                                     help="Used when elasticity can't be estimated reliably from your data.")
+        st.markdown("**Promotions**")
+        include_ly_promos = st.checkbox("Assume last year's promotions repeat", value=True,
+                                        help="Only applies when the forecast is built on baseline sales.")
+        st.markdown("**Recommendation limits**")
+        max_price_cut = st.slider("Largest price cut to consider (%)", 2, 25, 10)
+        max_promo_share = st.slider("Max share of weeks on promotion (%)", 25, 100, 50, step=25)
 
 if final_df.empty:
-    st.warning("⚠️ No data matches the selected filter combination.")
+    st.warning("No data matches this filter combination. Widen one of the filters in the sidebar.")
     st.stop()
 
 
 # ============================================================
-# 9. FORECAST COMPUTATION & METRICS
+# 10. FORECAST COMPUTATION
 # ============================================================
 weekly = aggregate_weekly(final_df)
-
 if len(weekly) < 4:
-    st.error("At least 4 weekly observations are required for a short-term forecast.")
+    st.error("At least 4 weeks of history are needed for this selection. Widen the filters or upload more weeks.")
     st.stop()
 
 last_date = weekly["date_key"].max()
 future_dates = [last_date + timedelta(weeks=i) for i in range(1, forecast_horizon + 1)]
 
-# Base demand forecast
 forecast_series, forecast_source, baseline_ratio = choose_forecast_series(weekly)
-if forecast_source != "Baseline Units":
-    if np.isfinite(baseline_ratio):
-        st.sidebar.warning(
-            f"Baseline rejected for forecasting: median Baseline/Actual ratio = {baseline_ratio:.2f}x. "
-            "Forecasting actual sales units instead."
-        )
+dates_tuple = tuple(weekly["date_key"])
+
+with st.spinner(f"Testing {len(candidate_names())} models on your history..."):
+    selection = select_best_model(tuple(float(v) for v in forecast_series), dates_tuple, forecast_horizon)
+
+champion = selection["champion"]
+prediction = predict_candidate(champion, forecast_series, dates_tuple, forecast_horizon)
+if prediction is None:  # safety net; the champion always ran in the backtest
+    champion = "4-Week Moving Average"
+    prediction = predict_candidate(champion, forecast_series, dates_tuple, forecast_horizon)
+model_fcst, season_idx = prediction
+
+ly = ly_benchmarks(weekly, future_dates)
+apply_promo_repeat = forecast_source == "Baseline Units" and include_ly_promos
+final_units, promo_lifts, macro_factor = apply_overlays(
+    model_fcst, ly, apply_promo_repeat, use_macro, price_yoy, cpi_inflation, elasticity_input
+)
+
+rsp_now = current_rsp(weekly)
+if not np.isfinite(rsp_now) or rsp_now <= 0:
+    st.error("No valid price data for this selection, so revenue can't be forecast.")
+    st.stop()
+final_value = final_units * rsp_now
+
+if selection["ratio_q"] is not None:
+    q_lo, q_hi = selection["ratio_q"]
+    range_label = "80% range (from backtest errors)"
+elif np.isfinite(selection["wmape"]):
+    q_lo, q_hi = max(0.0, 1 - selection["wmape"] / 100), 1 + selection["wmape"] / 100
+    range_label = "Range (± backtest WMAPE)"
+else:
+    q_lo, q_hi = 0.8, 1.2
+    range_label = "Indicative range (±20%, no backtest)"
+lower_units, upper_units = final_units * min(q_lo, 1.0), final_units * max(q_hi, 1.0)
+
+# ---- Comparison with the same weeks last year (matched weeks only)
+matched = np.isfinite(ly["Sales_Units"]) & np.isfinite(ly["Sales_Value"])
+n_matched = int(matched.sum())
+shortfall_weekly = np.where(matched, np.nan_to_num(ly["Sales_Units"]) - final_units, 0.0)
+
+if n_matched:
+    fc_units_m = float(final_units[matched].sum())
+    fc_value_m = float(final_value[matched].sum())
+    ly_units_m = float(ly["Sales_Units"][matched].sum())
+    ly_value_m = float(ly["Sales_Value"][matched].sum())
+    gap_units = ly_units_m - fc_units_m
+    unit_var_pct = (fc_units_m - ly_units_m) / ly_units_m * 100 if ly_units_m > 0 else np.nan
+    value_var = fc_value_m - ly_value_m
+    value_var_pct = value_var / ly_value_m * 100 if ly_value_m > 0 else np.nan
+else:
+    fc_units_m = fc_value_m = ly_units_m = ly_value_m = gap_units = np.nan
+    unit_var_pct = value_var = value_var_pct = np.nan
+
+is_decline = n_matched > 0 and gap_units > 0
+
+
+# ============================================================
+# 11. HEADLINE NUMBERS
+# ============================================================
+scope_label = " › ".join([category, subcategory, brand, product_label])
+st.markdown(f"#### {scope_label}")
+
+if warning_list:
+    with st.expander(f"ℹ️ Data notes ({len(warning_list)})"):
+        for w in warning_list:
+            st.write(f"- {w}")
+if forecast_source != "Baseline Units" and np.isfinite(baseline_ratio):
+    st.caption(f"Baseline not used for forecasting (median baseline/actual = {baseline_ratio:.2f}x); "
+               "forecasting actual sales instead.")
+
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric(f"{forecast_horizon}-week volume forecast", f"{final_units.sum():,.0f} units")
+c2.metric(f"{forecast_horizon}-week revenue forecast", f"R {final_value.sum():,.0f}")
+c3.metric("Volume vs same weeks LY",
+          f"{unit_var_pct:+.1f}%" if pd.notna(unit_var_pct) else "N/A",
+          delta=f"{fc_units_m - ly_units_m:+,.0f} units" if n_matched else None)
+c4.metric("Revenue vs same weeks LY",
+          f"R {value_var:+,.0f}" if pd.notna(value_var) else "N/A",
+          delta=f"{value_var_pct:+.1f}%" if pd.notna(value_var_pct) else None)
+c5.metric("Forecast error (WMAPE)",
+          f"{selection['wmape']:.1f}%" if np.isfinite(selection["wmape"]) else "N/A",
+          help="Average backtest error of the chosen model at this horizon. Lower is better.")
+
+if n_matched == 0:
+    st.warning("None of the forecast weeks have a matching week last year in the uploaded data, so the "
+               "year-on-year comparison and recommendations are unavailable. Upload at least 52 weeks of history.")
+elif n_matched < forecast_horizon:
+    st.warning(f"Only {n_matched} of {forecast_horizon} forecast weeks have a matching week last year. "
+               "The comparison and recommendations cover those weeks only.")
+
+
+# ============================================================
+# 12. VERDICT & RECOMMENDATION
+# ============================================================
+if is_decline:
+    st.markdown(
+        f"""<div class='verdict verdict-bad'>
+        <h4>Forecast is {abs(unit_var_pct):.1f}% below the same {n_matched} week(s) last year</h4>
+        <p>That is {gap_units:,.0f} fewer units and R {max(0.0, -value_var):,.0f} less revenue than last year.</p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    elasticity_used, elasticity_source = estimate_elasticity(weekly, elasticity_input)
+    promo_resp = historical_promo_response(weekly)
+    sku_gaps = sku_distribution_gaps(final_df, last_date)
+    max_promo_weeks = int(math.floor(forecast_horizon * max_promo_share / 100))
+
+    levers = [
+        evaluate_price_lever(gap_units, fc_units_m, rsp_now, elasticity_used, elasticity_source,
+                             max_price_cut, n_matched, max(0.0, price_yoy - cpi_inflation) if use_macro else 0.0),
+        evaluate_promo_lever(gap_units, final_units, shortfall_weekly, matched, promo_lifts,
+                             future_dates, rsp_now, promo_resp, max_promo_weeks),
+        evaluate_distribution_lever(gap_units, fc_units_m, weekly, ly, matched, rsp_now, sku_gaps),
+    ]
+    best, support = rank_levers(levers)
+
+    st.subheader("Recommended action")
+    if best is None:
+        st.warning("None of the three levers could be sized from this data. Check that the extract includes "
+                   "price history, promoted weeks and numeric distribution.")
     else:
-        st.sidebar.warning(
-            "Baseline rejected for forecasting: insufficient valid overlap. "
-            "Forecasting actual sales units instead."
+        st.markdown(
+            f"""<div class='rec-primary'>
+            <div class='rec-lever'>Best lever: {best['lever']} · closes {min(best['closure'], 100):.0f}% of the decline
+            (≈{best['units']:,.0f} units) · net revenue impact R {best['net_rev']:+,.0f}</div>
+            <div class='rec-action'>{best['action']}</div>
+            <div class='rec-why'>{best['why']}</div>
+            </div>""",
+            unsafe_allow_html=True,
         )
+        if support is not None:
+            remaining_units = gap_units - best["units"]
+            st.markdown(
+                f"""<div class='rec-support'>
+                <div class='rec-lever'>Add-on to close the remaining {remaining_units:,.0f} units: {support['lever']}</div>
+                <div class='rec-action'>{support['action']}</div>
+                <div class='rec-why'>{support['why']}</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
-base_volume_fcst, champion_model, model_wmape = run_baseline_model(
-    forecast_series, forecast_horizon
-)
-
-# 52-Week Promotional Overlay + SA Macro Elasticity Adjustment
-# Do not stack a promo lift on top of an actual-sales forecast because that
-# would count historical promotion twice.
-apply_promo_overlay = forecast_source == "Baseline Units"
-(
-    final_volume_fcst,
-    promo_lifts,
-    ly_benchmark_units,
-    ly_benchmark_values,
-    seasonal_factors,
-    macro_factor,
-) = apply_52wk_promo_overlay_and_sa_macro(
-    weekly,
-    future_dates,
-    base_volume_fcst,
-    price_yoy,
-    cpi_inflation,
-    elasticity,
-    apply_promo_overlay=apply_promo_overlay,
-)
-
-avg_rsp_latest = weekly["Effective_RSP"].iloc[-1] if weekly["Effective_RSP"].iloc[-1] > 0 else 25.0
-final_value_fcst = final_volume_fcst * avg_rsp_latest
-
-fcst_4wk_units = float(np.nansum(final_volume_fcst))
-fcst_4wk_val = float(np.nansum(final_value_fcst))
-
-# Compare forecast and LY actuals over the same matched weeks only.
-# Do not reprice LY units at today's RSP or compare a full forecast to a partial LY period.
-matched_ly_mask = np.isfinite(ly_benchmark_values) & np.isfinite(ly_benchmark_units)
-matched_ly_weeks = int(matched_ly_mask.sum())
-if matched_ly_weeks:
-    comparison_fcst_units = float(np.nansum(final_volume_fcst[matched_ly_mask]))
-    comparison_fcst_value = float(np.nansum(final_value_fcst[matched_ly_mask]))
-    ly_4wk_units = float(np.nansum(np.asarray(ly_benchmark_units)[matched_ly_mask]))
-    ly_4wk_val = float(np.nansum(np.asarray(ly_benchmark_values)[matched_ly_mask]))
-else:
-    comparison_fcst_units = np.nan
-    comparison_fcst_value = np.nan
-    ly_4wk_units = np.nan
-    ly_4wk_val = np.nan
-
-latest_promo_rsp = weekly["Promo_RSP_Weighted"].iloc[-1] if "Promo_RSP_Weighted" in weekly.columns and pd.notna(weekly["Promo_RSP_Weighted"].iloc[-1]) else avg_rsp_latest * 0.82
-latest_dist = weekly["Distribution"].iloc[-1] if "Distribution" in weekly.columns else 85.0
-
-scope_label = f"{category} > {subcategory} > {brand} > {product_label}"
-
-if matched_ly_weeks:
-    diagnostics = generate_gap_closing_recommendations(
-        scope_label, comparison_fcst_units, ly_4wk_units, comparison_fcst_value, ly_4wk_val,
-        avg_rsp_latest, latest_promo_rsp, latest_dist, brand
-    )
-else:
-    diagnostics = {
-        "unit_deficit": np.nan,
-        "unit_gap": np.nan,
-        "unit_deficit_pct": np.nan,
-        "unit_variance_pct": np.nan,
-        "value_gap": np.nan,
-        "revenue_at_risk": np.nan,
-        "actions": [],
-    }
-
-
-# ============================================================
-# 10. DASHBOARD METRICS & PRESCRIPTIVE PANEL
-# ============================================================
-st.markdown(f"### Active Scope: **{scope_label}**")
-if matched_ly_weeks == 0:
-    st.warning(
-        "No forecast weeks could be matched to prior-year observations within 7 days. "
-        "YoY variance and revenue-at-risk metrics are unavailable; upload a date range containing "
-        "the corresponding prior-year weeks."
-    )
-elif matched_ly_weeks < forecast_horizon:
-    st.warning(
-        f"Only {matched_ly_weeks} of {forecast_horizon} forecast weeks have a matched prior-year "
-        "observation within 7 days. YoY comparisons cover matched weeks only; check the date range "
-        "before interpreting the gap."
+    with st.expander("How the three levers compare", expanded=best is None):
+        compare = pd.DataFrame([{
+            "Lever": lv["lever"] + (" ✅" if best is not None and lv is best else ""),
+            "Action": lv["action"] if lv["available"] else "Not available",
+            "Units recovered": lv["units"],
+            "% of decline closed": min(lv["closure"], 100.0),
+            "Net revenue impact (R)": lv["net_rev"],
+            "Reasoning": lv["why"],
+        } for lv in levers])
+        st.dataframe(
+            compare.style.format({"Units recovered": "{:,.0f}", "% of decline closed": "{:.0f}%",
+                                  "Net revenue impact (R)": "R {:+,.0f}"}),
+            width="stretch", hide_index=True,
+        )
+        st.caption("The best lever closes the most of the decline; when two levers close a similar share "
+                   f"(within {TIE_BAND_PCT:.0f} points), the one with the better revenue result wins. "
+                   "Estimates come from your own history and should be validated with the customer before committing spend.")
+elif n_matched:
+    st.markdown(
+        f"""<div class='verdict verdict-good'>
+        <h4>On track: forecast is {unit_var_pct:+.1f}% vs the same {n_matched} week(s) last year</h4>
+        <p>No recovery action is needed. Keep price, promotion and distribution execution in line with the plan.</p>
+        </div>""",
+        unsafe_allow_html=True,
     )
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric(f"{forecast_horizon}-Wk Volume Forecast", f"{fcst_4wk_units:,.0f} units")
-col2.metric(f"{forecast_horizon}-Wk Revenue Forecast", f"R {fcst_4wk_val:,.2f}")
-col3.metric(
-    "YoY Volume Variance",
-    f"{diagnostics['unit_variance_pct']:+.1f}%" if pd.notna(diagnostics["unit_variance_pct"]) else "N/A",
-    delta=f"{diagnostics['unit_variance_pct']:+.1f}%" if pd.notna(diagnostics["unit_variance_pct"]) else None,
-    delta_color="normal",
-)
-col4.metric(
-    "Revenue at Risk",
-    f"R {diagnostics['revenue_at_risk']:,.2f}" if pd.notna(diagnostics["revenue_at_risk"]) else "N/A",
-)
-
-st.markdown("---")
-
-
-if pd.notna(diagnostics["unit_deficit_pct"]) and diagnostics["unit_deficit_pct"] > 0:
-    st.markdown(f"""
-    <div class='alert-card'>
-        <h4 style='margin:0; color:#991B1B;'>🚨 YoY Deficit Alert: Forecast is {diagnostics['unit_deficit_pct']:.1f}% Below Last Year for {matched_ly_weeks} matched week(s)</h4>
-        <p style='margin-top:4px; margin-bottom:0; color:#7F1D1D; font-size:14px;'>
-            Projected Revenue Shortfall: <strong>R {diagnostics['revenue_at_risk']:,.2f}</strong>. 
-            Commercial actions to close the gap before execution:
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    st.subheader("💡 Actionable Commercial Recommendations")
-    for action in diagnostics["actions"]:
-        st.markdown(f"""
-        <div class='solution-box'>
-            <strong>[{action['type']}] {action['title']}</strong><br/>
-            <span style='color: #374151; font-size: 14px;'>{action['detail']}</span>
-        </div>
-        """, unsafe_allow_html=True)
-        
-    st.markdown("<br/>", unsafe_allow_html=True)
-
 
 # ============================================================
-# 11. PLOTLY CHART: CONTINUOUS HISTORICAL + PROMO FORECAST
+# 13. CHART
 # ============================================================
-st.subheader(f"📈 Historical vs. {forecast_horizon}-Week Forecast")
+st.subheader(f"History and {forecast_horizon}-week forecast")
+view = st.radio("Show", ["Volume (units)", "Revenue (R)"], horizontal=True, label_visibility="collapsed")
+is_units = view.startswith("Volume")
 
-metric_toggle = st.radio("Select Chart View Metric:", ["Volume (Units)", "Sales Value (Revenue R)"], horizontal=True)
+hist_y = weekly["Sales_Units"] if is_units else weekly["Sales_Value"]
+fc_y = final_units if is_units else final_value
+lo_y = lower_units if is_units else lower_units * rsp_now
+hi_y = upper_units if is_units else upper_units * rsp_now
+ly_y = ly["Sales_Units"] if is_units else ly["Sales_Value"]
 
 fig = go.Figure()
-
-if "Units" in metric_toggle:
-    # Historical Actual Units
-    fig.add_trace(go.Scatter(
-        x=weekly["date_key"], y=weekly["Sales_Units"],
-        mode="lines+markers", name="Actual Units",
-        line=dict(color="#7C3AED", width=2.5), marker=dict(size=5)
-    ))
-
-    # Historical Baseline Units - hide a rejected/invalid baseline from the main chart.
-    if forecast_source == "Baseline Units":
-        fig.add_trace(go.Scatter(
-            x=weekly["date_key"], y=weekly["Baseline_Units"],
-            mode="lines+markers", name="Baseline Units",
-            line=dict(color="#EA580C", width=2, dash="dot"), marker=dict(size=4)
-        ))
-
-    # Seamless Anchor Point
-    anchor_x = [weekly["date_key"].iloc[-1]] + future_dates
-    anchor_y = [float(weekly["Sales_Units"].iloc[-1])] + list(final_volume_fcst)
-
-    # Promo Overlay Forecast Line
-    fig.add_trace(go.Scatter(
-        x=anchor_x, y=anchor_y,
-        mode="lines+markers", name=(
-            f"Forecast | {champion_model}"
-            + (" | 52-Wk Seasonality + Promo" if apply_promo_overlay else " | 52-Wk Seasonality + Actual-based")
-        ),
-        line=dict(color="#059669", width=3, dash="dash"), marker=dict(size=7, symbol="diamond")
-    ))
-
-    # 52-Week Same Period Last Year Benchmark
-    fig.add_trace(go.Scatter(
-        x=future_dates, y=ly_benchmark_units,
-        mode="lines+markers", name="52-Week LY Benchmark",
-        line=dict(color="#D97706", width=2, dash="dot"), marker=dict(size=5)
-    ))
-
-    upper_bound = [u * 1.12 for u in final_volume_fcst]
-    lower_bound = [u * 0.88 for u in final_volume_fcst]
-    fig.add_trace(go.Scatter(
-        x=future_dates + future_dates[::-1],
-        y=upper_bound + lower_bound[::-1],
-        fill="toself", fillcolor="rgba(5, 150, 105, 0.12)",
-        line=dict(color="rgba(255,255,255,0)"), hoverinfo="skip",
-        showlegend=True, name="Planning Range (±12%)"
-    ))
-
-    y_title = "Units"
-
-else:
-    # Historical Sales Value
-    fig.add_trace(go.Scatter(
-        x=weekly["date_key"], y=weekly["Sales_Value"],
-        mode="lines+markers", name="Historical Sales Value",
-        line=dict(color="#1E3A8A", width=2.5), marker=dict(size=5)
-    ))
-
-    anchor_x = [weekly["date_key"].iloc[-1]] + future_dates
-    anchor_y = [float(weekly["Sales_Value"].iloc[-1])] + list(final_value_fcst)
-
-    fig.add_trace(go.Scatter(
-        x=anchor_x, y=anchor_y,
-        mode="lines+markers", name="Revenue Forecast",
-        line=dict(color="#059669", width=3, dash="dash"), marker=dict(size=7, symbol="diamond")
-    ))
-
-    upper_bound_val = [v * 1.12 for v in final_value_fcst]
-    lower_bound_val = [v * 0.88 for v in final_value_fcst]
-    fig.add_trace(go.Scatter(
-        x=future_dates + future_dates[::-1],
-        y=upper_bound_val + lower_bound_val[::-1],
-        fill="toself", fillcolor="rgba(5, 150, 105, 0.12)",
-        line=dict(color="rgba(255,255,255,0)"), hoverinfo="skip",
-        showlegend=True, name="Planning Range (±12%)"
-    ))
-
-    y_title = "Sales Value (R)"
-
-# Force every weekly observation to appear on the x-axis.
-all_chart_dates = list(weekly["date_key"]) + list(future_dates)
-all_chart_dates = pd.to_datetime(pd.Series(all_chart_dates)).drop_duplicates().sort_values().tolist()
-tick_text = [d.strftime("%d %b") for d in all_chart_dates]
-
-# Make the forecast boundary visually obvious.
-fig.add_vline(
-    x=weekly["date_key"].iloc[-1],
-    line_width=1,
-    line_dash="dot",
-    line_color="#64748B",
-)
-fig.add_annotation(
-    x=weekly["date_key"].iloc[-1],
-    y=1.02,
-    xref="x",
-    yref="paper",
-    text="Forecast starts →",
-    showarrow=False,
-    font=dict(size=11, color="#475569"),
-    xanchor="left",
-)
-
+fig.add_trace(go.Scatter(x=future_dates + future_dates[::-1], y=list(hi_y) + list(lo_y)[::-1],
+                         fill="toself", fillcolor="rgba(31, 54, 199, 0.12)", line=dict(color="rgba(0,0,0,0)"),
+                         hoverinfo="skip", name=range_label))
+fig.add_trace(go.Scatter(x=weekly["date_key"], y=hist_y, mode="lines+markers", name="Actual",
+                         line=dict(color="#0F172A", width=2), marker=dict(size=4)))
+if is_units and forecast_source == "Baseline Units":
+    fig.add_trace(go.Scatter(x=weekly["date_key"], y=weekly["Baseline_Units"], mode="lines", name="Baseline",
+                             line=dict(color="#94A3B8", width=1.5, dash="dot")))
+fig.add_trace(go.Scatter(x=[weekly["date_key"].iloc[-1]] + future_dates,
+                         y=[float(hist_y.iloc[-1])] + list(fc_y), mode="lines+markers",
+                         name=f"Forecast ({champion})", line=dict(color="#1F36C7", width=3, dash="dash"),
+                         marker=dict(size=7, symbol="diamond")))
+fig.add_trace(go.Scatter(x=future_dates, y=ly_y, mode="lines+markers", name="Same week last year",
+                         line=dict(color="#D97706", width=2, dash="dot"), marker=dict(size=6)))
+fig.add_vline(x=weekly["date_key"].iloc[-1], line_width=1, line_dash="dot", line_color="#64748B")
+fig.add_annotation(x=weekly["date_key"].iloc[-1], y=1.02, xref="x", yref="paper", text="Forecast starts →",
+                   showarrow=False, font=dict(size=11, color="#475569"), xanchor="left")
 fig.update_layout(
-    template="plotly_white", height=560, hovermode="x unified",
-    margin=dict(l=60, r=30, t=90, b=115),
-    xaxis=dict(
-        title="Week Start Date",
-        showgrid=True,
-        tickmode="array",
-        tickvals=all_chart_dates,
-        ticktext=tick_text,
-        tickangle=-45,
-        automargin=True,
-    ),
-    yaxis=dict(title=y_title, showgrid=True),
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+    template="plotly_white", height=520, hovermode="x unified", margin=dict(l=60, r=30, t=70, b=60),
+    xaxis=dict(title="Week starting", showgrid=True),
+    yaxis=dict(title="Units" if is_units else "Revenue (R)", showgrid=True),
+    legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1),
 )
-
-st.plotly_chart(fig, use_container_width=True)
-
-st.caption(
-    f"Forecast Formula: **Base Forecast × 52-Wk Seasonality × Promo Lift × Macro Factor** | "
-    f"Forecast Source: **{forecast_source}** | "
-    f"Baseline Engine: **{champion_model}** | "
-    f"SA Macro Factor: **{macro_factor:.4f}** "
-    f"(Net Price Squeeze: {max(0, price_yoy - cpi_inflation):.1f}%)"
-)
-
-forecast_method_text = (
-    f"The forecast is based on **{forecast_source}** using **{champion_model}**. "
-    "The orange LY line is a comparison benchmark; it is not automatically added to the forecast. "
-    "The green planning range is a planning band, not a statistical confidence interval."
-)
-st.caption(forecast_method_text)
+st.plotly_chart(fig, width="stretch")
 
 
 # ============================================================
-# 12. FORECAST DETAIL TABLE
+# 14. WEEK-BY-WEEK TABLE
 # ============================================================
-st.markdown("---")
-st.subheader("🔮 Forecast Detail Table")
-
+st.subheader("Week-by-week forecast")
 table_df = pd.DataFrame({
-    "Week": [d.strftime("%Y-%m-%d") for d in future_dates],
-    "Base Forecast Units": base_volume_fcst,
-    "52-Wk Promo Lift Factor": [f"{l:.2f}x" for l in promo_lifts],
-    "Selected Forecast Units": final_volume_fcst,
-    "Forecast Revenue": final_value_fcst,
-    "Same Week LY Units": ly_benchmark_units,
-    "Same Week LY Sales Value": ly_benchmark_values,
+    "Week starting": [d.strftime("%Y-%m-%d") for d in future_dates],
+    "Forecast units": final_units,
+    "Range low": lower_units,
+    "Range high": upper_units,
+    "Forecast revenue": final_value,
+    "Same week LY units": ly["Sales_Units"],
+    "Same week LY revenue": ly["Sales_Value"],
+    "Units vs LY": np.where(matched, final_units - np.nan_to_num(ly["Sales_Units"]), np.nan),
+    "Seasonal index": season_idx,
+    "LY promo lift": promo_lifts,
 })
+
+
+def _colour_gap(v):
+    if pd.isna(v):
+        return ""
+    return "color: #B91C1C; font-weight: 600" if v < 0 else "color: #15803D"
+
 
 st.dataframe(
     table_df.style.format({
-        "Base Forecast Units": "{:,.0f}",
-        "Selected Forecast Units": "{:,.0f}",
-        "Forecast Revenue": "R {:,.2f}",
-        "Same Week LY Units": "{:,.0f}",
-        "Same Week LY Sales Value": "R {:,.2f}",
-    }),
-    use_container_width=True, hide_index=True
+        "Forecast units": "{:,.0f}", "Range low": "{:,.0f}", "Range high": "{:,.0f}",
+        "Forecast revenue": "R {:,.0f}", "Same week LY units": "{:,.0f}",
+        "Same week LY revenue": "R {:,.0f}", "Units vs LY": "{:+,.0f}",
+        "Seasonal index": "{:.2f}", "LY promo lift": "{:.2f}x",
+    }, na_rep="-").map(_colour_gap, subset=["Units vs LY"]),
+    width="stretch", hide_index=True,
 )
+st.download_button("Download forecast (CSV)", table_df.to_csv(index=False).encode("utf-8"),
+                   file_name=f"forecast_{forecast_horizon}wk_{last_date:%Y%m%d}.csv", mime="text/csv")
 
-st.caption(
-    f"Forecast Input: **{forecast_source}** | Model: **{champion_model}** "
-    f"| Backtest WMAPE: **{model_wmape:.1f}%** "
-    f"| SA Macro Factor: **{macro_factor:.4f}** "
-    f"(Net Price Squeeze: {max(0, price_yoy - cpi_inflation):.1f}%)"
-)
+
+# ============================================================
+# 15. MODEL SELECTION & METHOD
+# ============================================================
+with st.expander("🏆 How the model was chosen"):
+    board = selection["leaderboard"]
+    if board.empty:
+        st.info(f"Not enough history to compare models at a {forecast_horizon}-week horizon "
+                f"(about {selection['weeks_needed']} weeks needed). Using the 4-week moving average.")
+    else:
+        st.write(f"Each model forecast {forecast_horizon} weeks ahead from {selection['n_folds']} past points in "
+                 "your history, and its error was measured against what actually sold. "
+                 f"**{champion}** had the lowest error, so it is the only model used.")
+        shown = board.copy()
+        shown.insert(0, "", ["🏆"] + [""] * (len(shown) - 1))
+        st.dataframe(shown.style.format({"WMAPE %": "{:.1f}", "Bias %": "{:+.1f}"}),
+                     width="stretch", hide_index=True)
+        st.caption("WMAPE = total absolute error ÷ total actual sales. Bias above 0 means the model "
+                   "over-forecasts. Models with '52-Wk Seasonality' follow last year's weekly shape.")
+
+with st.expander("📘 How the forecast is built"):
+    st.markdown(
+        f"""
+- **Forecast input:** {forecast_source}.
+- **Model:** {champion}, picked automatically for the lowest backtest error.
+- **Last year's promotions:** {"repeated in the forecast (baseline × last year's promo lift)" if apply_promo_repeat else "not added on top (they are already in actual sales, or switched off)"}.
+- **SA macro factor:** {macro_factor:.3f} (price increase {price_yoy:.1f}% vs food CPI {cpi_inflation:.1f}%{"" if use_macro else ", switched off"}).
+- **Revenue:** forecast units × current regular shelf price (R {rsp_now:,.2f}).
+- **Range:** {range_label.lower()}.
+- **Comparison:** each forecast week is matched to the same week 52 weeks earlier.
+        """
+    )
