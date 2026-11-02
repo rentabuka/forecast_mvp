@@ -220,8 +220,7 @@ def validate_and_prepare(raw_df):
 
     for col in ["Category", "Subcategory", "Brand", "Product"]:
         df[col] = df[col].fillna("Unknown").astype(str)
-    df["ProductsID"] = df["ProductsID"].fillna("Unknown").astype(str)
-
+    
     return True, errors, warnings_list, df.sort_values("date_key").reset_index(drop=True), measure_window
 
 
