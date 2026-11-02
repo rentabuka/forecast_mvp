@@ -207,16 +207,16 @@ def validate_and_prepare(raw_df):
         df["Incremental Units"] = 0.0
 
     # ---- Distribution: never invent a value. Missing data disables the distribution lever.
-    if "Numeric Distribution" in df.columns:
-        dist = clean_number(df["Numeric Distribution"])
+    if "CY Numeric Distribution" in df.columns:
+        dist = clean_number(df["CY Numeric Distribution"])
         if not dist.dropna().empty and dist.dropna().max() <= 1.0:
             dist = dist * 100
-        df["Numeric Distribution"] = dist.clip(0, 100)
+        df["CY Numeric Distribution"] = dist.clip(0, 100)
         if dist.dropna().empty:
-            warnings_list.append("'Numeric Distribution' is empty; distribution recommendations are disabled.")
+            warnings_list.append("'CY Numeric Distribution' is empty; distribution recommendations are disabled.")
     else:
-        df["Numeric Distribution"] = np.nan
-        warnings_list.append("No 'Numeric Distribution' column found; distribution recommendations are disabled.")
+        df["CY Numeric Distribution"] = np.nan
+        warnings_list.append("No 'CY Numeric Distribution' column found; distribution recommendations are disabled.")
 
     for col in ["Category", "Subcategory", "Brand", "Product"]:
         df[col] = df[col].fillna("Unknown").astype(str)
@@ -269,7 +269,7 @@ def aggregate_weekly(df):
     df_copy = df.copy()
     for col, default_val in [
         ("Sales Units", 0.0), ("Sales Value", 0.0), ("Baseline Units", 0.0),
-        ("Baseline Value", 0.0), ("Incremental Units", 0.0), ("Numeric Distribution", np.nan),
+        ("Baseline Value", 0.0), ("Incremental Units", 0.0), ("CY Numeric Distribution", np.nan),
     ]:
         if col not in df_copy.columns:
             df_copy[col] = default_val
@@ -281,7 +281,7 @@ def aggregate_weekly(df):
             Baseline_Units=("Baseline Units", "sum"),
             Sales_Value=("Sales Value", "sum"),
             Baseline_Value=("Baseline Value", "sum"),
-            Distribution=("Numeric Distribution", "mean"),
+            Distribution=("CY Numeric Distribution", "mean"),
         )
         .sort_values("date_key")
         .reset_index(drop=True)
@@ -709,14 +709,14 @@ def historical_promo_response(weekly):
 
 
 def sku_distribution_gaps(df, last_date, top_n=5):
-    """SKUs whose numeric distribution today is below the same week last year."""
-    d = df.dropna(subset=["Numeric Distribution"])
+    """SKUs whose CY Numeric Distribution today is below the same week last year."""
+    d = df.dropna(subset=["CY Numeric Distribution"])
     if d.empty:
         return pd.DataFrame()
     ly_date = last_date - timedelta(weeks=52)
     rows = []
     for prod, grp in d.groupby("Product"):
-        s = grp.groupby("date_key")["Numeric Distribution"].mean().sort_index()
+        s = grp.groupby("date_key")["CY Numeric Distribution"].mean().sort_index()
         now, ly = _value_near(s, last_date), _value_near(s, ly_date)
         if np.isfinite(now) and np.isfinite(ly) and ly - now >= 1:
             rows.append({"SKU": prod, "Distribution LY %": ly, "Distribution now %": now, "Points lost": ly - now})
@@ -797,7 +797,7 @@ def evaluate_promo_lever(gap, fcst_weekly, shortfall_weekly, matched, overlay_li
 def evaluate_distribution_lever(gap, fcst_units, weekly, ly, matched, rsp, sku_gaps):
     dist = weekly["Distribution"].dropna()
     if dist.empty:
-        return _unavailable("Distribution", "No numeric distribution data in the extract.")
+        return _unavailable("Distribution", "No CY Numeric Distribution data in the extract.")
 
     current = float(dist.iloc[-1])
     ly_dist = float(np.nanmean(ly["Distribution"][matched])) if np.isfinite(ly["Distribution"][matched]).any() else np.nan
@@ -811,7 +811,7 @@ def evaluate_distribution_lever(gap, fcst_units, weekly, ly, matched, rsp, sku_g
         )
 
     recovered = min(gap, fcst_units / current * points)  # volume scales with stores stocking
-    why = (f"Numeric distribution is {current:.1f}% vs {ly_dist:.1f}% in the same weeks last year "
+    why = (f"CY Numeric Distribution is {current:.1f}% vs {ly_dist:.1f}% in the same weeks last year "
            f"(recent best {recent_best:.1f}%). Volume is assumed to scale with the share of stores stocking.")
     if not sku_gaps.empty:
         why += " Biggest losses: " + "; ".join(
@@ -820,7 +820,7 @@ def evaluate_distribution_lever(gap, fcst_units, weekly, ly, matched, rsp, sku_g
     return {
         "lever": "Distribution", "available": True, "units": recovered,
         "closure": recovered / gap * 100, "net_rev": recovered * rsp,
-        "action": (f"Restore numeric distribution from {current:.1f}% to {target:.1f}% "
+        "action": (f"Restore CY Numeric Distribution from {current:.1f}% to {target:.1f}% "
                    f"(+{points:.1f} pts): fix out-of-stocks and regain lost listings."),
         "why": why,
     }
@@ -1092,7 +1092,7 @@ if is_decline:
     st.subheader("Recommended action")
     if best is None:
         st.warning("None of the three levers could be sized from this data. Check that the extract includes "
-                   "price history, promoted weeks and numeric distribution.")
+                   "price history, promoted weeks and CY Numeric Distribution.")
     else:
         st.markdown(
             f"""<div class='rec-primary'>
