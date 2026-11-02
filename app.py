@@ -61,7 +61,7 @@ MEASURE_SETS = {
     },
 }
 
-BASE_COLUMNS = ["Full Date", "Brand", "Category", "Product", "ProductsID", "Subcategory"]
+BASE_COLUMNS = ["Full Date", "Brand", "Category", "Product", "Subcategory"]
 
 
 # ============================================================
