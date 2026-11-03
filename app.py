@@ -1252,3 +1252,145 @@ with st.expander("📘 How the forecast is built"):
 - **Comparison:** each forecast week is matched to the same week 52 weeks earlier.
         """
     )
+
+# ============================================================
+# 13b. FORECAST LOSS BY REGION x RETAILER (80/20)
+# ============================================================
+LOSS_PARETO_SHARE = 80.0   # list the combinations that together make up this share of the forecast loss
+LOSS_TREND_WEEKS = 8       # recent weeks used for each combination's trend vs last year
+
+
+@st.cache_data(show_spinner=False)
+def region_retailer_projection(df, horizon):
+    """
+    Quick projection for every Region x Retailer combination over the forecast horizon:
+        projected = same weeks last year x the combination's trend over its last 8 weeks vs last year
+    Each combination is matched on its own weeks, so retailers that report on different
+    week-end days still line up. Combinations without last-year history are projected at
+    their recent run-rate and get no loss figure (there is nothing to lose against).
+    """
+    d = df.assign(
+        Region=df["Region"].fillna("Unknown").astype(str).str.strip(),
+        Retailer=df["Retailer"].fillna("Unknown").astype(str).str.strip(),
+    )
+    g = (
+        d.groupby(["Region", "Retailer", "date_key"])
+        .agg(units=("Sales Units", "sum"), value=("Sales Value", "sum"))
+        .reset_index()
+    )
+    global_last = d["date_key"].max()
+
+    rows = []
+    for (region, retailer), grp in g.groupby(["Region", "Retailer"]):
+        s = grp.set_index("date_key").sort_index()
+        if len(s) < 4:
+            continue
+        own_last = s.index[-1]
+        stopped = (global_last - own_last).days > 21          # no sales for 3+ weeks
+        base = global_last if stopped else own_last
+        recent = [base - timedelta(weeks=k) for k in range(LOSS_TREND_WEEKS - 1, -1, -1)]
+        future = [base + timedelta(weeks=k) for k in range(1, horizon + 1)]
+
+        def near(col, dates, weeks_back):
+            return np.array([_value_near(s[col], dt - timedelta(weeks=weeks_back)) for dt in dates])
+
+        row = {"Region": region, "Retailer": retailer, "has_ly": False,
+               "LY revenue": np.nan, "LY units": np.nan, "Recent trend vs LY %": np.nan}
+
+        ly_recent_v, ly_recent_u = near("value", recent, 52), near("units", recent, 52)
+        ok = np.isfinite(ly_recent_v) & (ly_recent_v > 0)
+        fut_ly_v, fut_ly_u = near("value", future, 52), near("units", future, 52)
+        fut_ok = np.isfinite(fut_ly_v) & np.isfinite(fut_ly_u)
+
+        if ok.sum() >= 4 and fut_ok.any():
+            now_v = np.nan_to_num(near("value", recent, 0))   # a missing week counts as no sales
+            now_u = np.nan_to_num(near("units", recent, 0))
+            trend_v = float(np.clip(now_v[ok].sum() / ly_recent_v[ok].sum(), 0.0, 2.0))
+            ly_u_recent = float(np.nansum(ly_recent_u[ok]))
+            trend_u = float(np.clip(now_u[ok].sum() / ly_u_recent, 0.0, 2.0)) if ly_u_recent > 0 else trend_v
+            fill = horizon / int(fut_ok.sum())               # scale up if a LY week is missing
+            ly_v = float(fut_ly_v[fut_ok].sum()) * fill
+            ly_u = float(fut_ly_u[fut_ok].sum()) * fill
+            row.update({
+                "has_ly": True, "LY revenue": ly_v, "LY units": ly_u,
+                "Recent trend vs LY %": (trend_v - 1) * 100,
+                "Projected revenue": ly_v * trend_v, "Projected units": ly_u * trend_u,
+            })
+        else:
+            sold = s[s["value"] > 0].tail(4)
+            run_v = 0.0 if stopped or sold.empty else float(sold["value"].mean())
+            run_u = 0.0 if stopped or sold.empty else float(sold["units"].mean())
+            row.update({"Projected revenue": run_v * horizon, "Projected units": run_u * horizon})
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+st.subheader("Where the forecast loss sits: Region × Retailer (80/20)")
+
+rr = region_retailer_projection(final_df, forecast_horizon)
+if rr.empty:
+    st.info("There isn't enough Region × Retailer history in this selection to break the forecast down.")
+else:
+    # Spread the headline forecast across combinations in proportion to each one's own
+    # projection, so the combination figures add up to the forecast shown above.
+    proj_rev, proj_units = rr["Projected revenue"].sum(), rr["Projected units"].sum()
+    rr["Forecast revenue"] = rr["Projected revenue"] * (final_value.sum() / proj_rev if proj_rev > 0 else 1.0)
+    rr["Forecast units"] = rr["Projected units"] * (final_units.sum() / proj_units if proj_units > 0 else 1.0)
+    rr["Loss (R)"] = rr["LY revenue"] - rr["Forecast revenue"]
+    rr["Loss (units)"] = rr["LY units"] - rr["Forecast units"]
+
+    n_combos = len(rr)
+    losers = (rr[rr["has_ly"] & (rr["Loss (R)"] > 0)]
+              .sort_values("Loss (R)", ascending=False).reset_index(drop=True))
+    growth = float(-rr.loc[rr["has_ly"] & (rr["Loss (R)"] < 0), "Loss (R)"].sum())
+
+    if losers.empty:
+        st.success("No Region × Retailer combination is forecast below the same weeks last year.")
+    else:
+        total_loss = float(losers["Loss (R)"].sum())
+        losers["Change vs LY %"] = -losers["Loss (R)"] / losers["LY revenue"] * 100
+        losers["Share of loss %"] = losers["Loss (R)"] / total_loss * 100
+        losers["Cumulative %"] = losers["Share of loss %"].cumsum()
+        losers.insert(0, "Rank", np.arange(1, len(losers) + 1))
+        vital = losers[(losers["Cumulative %"] - losers["Share of loss %"]) < LOSS_PARETO_SHARE]
+        pct_combos = len(vital) / n_combos * 100
+
+        st.markdown(
+            f"**{len(vital)} of {n_combos} Region × Retailer combinations ({pct_combos:.0f}%) account for "
+            f"{vital['Share of loss %'].sum():.0f}% of the forecast loss:** R {vital['Loss (R)'].sum():,.0f} "
+            f"of the R {total_loss:,.0f} lost across the {len(losers)} combinations forecast below last year."
+        )
+        if growth > 0:
+            st.caption(f"The other combinations are forecast to grow by R {growth:,.0f} versus last year, "
+                       "which is why the total can be on track while these accounts lose ground.")
+        if pct_combos > 30:
+            st.caption("The loss is spread across many combinations rather than concentrated in a few, "
+                       "so the 80/20 rule only partly applies here.")
+
+        loss_cols = ["Rank", "Region", "Retailer", "LY revenue", "Forecast revenue", "Loss (R)", "Change vs LY %",
+                     "Loss (units)", "Share of loss %", "Cumulative %", "Recent trend vs LY %"]
+        loss_fmt = {
+            "LY revenue": "R {:,.0f}", "Forecast revenue": "R {:,.0f}", "Loss (R)": "R {:,.0f}",
+            "Change vs LY %": "{:+.1f}%", "Loss (units)": "{:,.0f}", "Share of loss %": "{:.1f}%",
+            "Cumulative %": "{:.0f}%", "Recent trend vs LY %": "{:+.1f}%",
+        }
+        st.dataframe(vital[loss_cols].style.format(loss_fmt, na_rep="-"), width="stretch", hide_index=True)
+
+        rest = losers[~losers["Rank"].isin(vital["Rank"])]
+        if not rest.empty:
+            with st.expander(f"The other {len(rest)} combination(s) forecast below last year "
+                             f"({rest['Share of loss %'].sum():.0f}% of the loss)"):
+                st.dataframe(rest[loss_cols].style.format(loss_fmt, na_rep="-"), width="stretch", hide_index=True)
+
+        st.download_button("Download Region × Retailer loss list (CSV)",
+                           losers[loss_cols].to_csv(index=False).encode("utf-8"),
+                           file_name=f"forecast_loss_region_retailer_{last_date:%Y%m%d}.csv", mime="text/csv")
+        st.caption(f"Each combination is projected as the same weeks last year × its trend over its last "
+                   f"{LOSS_TREND_WEEKS} weeks vs last year. The headline forecast is then shared across combinations "
+                   "in proportion to these projections, so the figures add up to the forecast above. "
+                   "Loss = same weeks last year − forecast.")
+
+    no_ly = int((~rr["has_ly"]).sum())
+    if no_ly:
+        st.caption(f"{no_ly} combination(s) have no sales for the same weeks last year, so they can't show a loss.")
