@@ -45,6 +45,8 @@ TIE_BAND_PCT = 10.0                  # levers within 10 pts of gap closure compe
 FOCUS_TREND_WEEKS = 8                # recent weeks used for each Region x Retailer YoY trend
 FOCUS_DIST_LOOKBACK = 13             # weeks used to find each combination's recent best distribution
 FOCUS_MAX_DIST_GAIN = 1.0            # cap distribution upside at +100% of projected sales
+FOCUS_STALE_DAYS = 21                # no data for 3+ weeks before the latest week = possible delisting
+FOCUS_DIST_MIN_GAP = 2.0             # distribution must be 2+ pts below achievable to make the fix list
 
 
 # ============================================================
@@ -859,28 +861,50 @@ def rank_levers(levers):
 
 
 # ============================================================
-# 7b. 80/20 FOCUS: REGION x RETAILER OPPORTUNITIES
+# 7b. 80/20 FOCUS & DISTRIBUTION FIX LIST: REGION x RETAILER
 # ============================================================
+def _dist_position(dist, global_last):
+    """
+    Where numeric distribution stands for one series (a combination or a SKU in it):
+      now     = average of its last 4 weeks (0 if it stopped reporting = possible delisting)
+      ly      = the same 4 weeks last year (NaN when there is no history that far back)
+      best    = best 4-week average in the last FOCUS_DIST_LOOKBACK weeks
+      target  = the higher of ly and best (what it has shown it can achieve)
+    """
+    s = dist.dropna().sort_index()
+    if s.empty:
+        return None
+    last = s.index[-1]
+    stale = (global_last - last).days > FOCUS_STALE_DAYS
+    now = 0.0 if stale else float(s.iloc[-4:].mean())
+    best = float(s.rolling(4, min_periods=2).mean().iloc[-FOCUS_DIST_LOOKBACK:].max())
+    base = global_last if stale else last
+    ly_vals = np.array([_value_near(s, base - timedelta(weeks=52 + k)) for k in range(4)])
+    ly_vals = ly_vals[np.isfinite(ly_vals)]
+    ly = float(ly_vals.mean()) if ly_vals.size else np.nan
+    target = float(np.nanmax([best, ly])) if np.isfinite([best, ly]).any() else np.nan
+    return {"now": now, "ly": ly, "best": best, "target": target, "stale": stale, "last": last}
+
+
 @st.cache_data(show_spinner=False)
 def opportunity_pareto(df, future_dates, cpi_inflation, pareto_target):
     """
     80/20 view: which Region x Retailer combinations hold most of the sales upside.
 
-    For each combination, over the forecast weeks:
-      projected     = same weeks last year x recent YoY trend (last FOCUS_TREND_WEEKS weeks)
-      recovery      = revenue lost vs last year if that trend holds (0 when growing)
-      distribution  = extra revenue if numeric distribution returns to the higher of last
-                      year and its best of the last FOCUS_DIST_LOOKBACK weeks
-      opportunity   = the larger of the two. Lost distribution is often WHY sales fell,
-                      so adding them together would double count.
-
-    Combinations are ranked by opportunity. The "vital few" are the smallest set that
-    together hold `pareto_target`% of the total opportunity.
+    Each combination is measured on its OWN weeks (retailers can report on different week-end
+    days), over a window as long as the forecast horizon:
+      projected     = same weeks last year x recent YoY trend, or the recent run-rate when
+                      there is no last-year history for that combination
+      recovery      = revenue lost vs last year if the trend holds (or the run-rate before a
+                      possible delisting)
+      distribution  = extra revenue if numeric distribution returns to its achievable level
+      opportunity   = the larger of the two (adding them would double count, because lost
+                      distribution is often WHY sales fell)
+    The "vital few" are the smallest set that together hold `pareto_target`% of the upside.
     Returns (table, combinations evaluated, combinations skipped, total projected revenue).
     """
-    empty = (pd.DataFrame(), 0, 0, 0.0)
     if df.empty:
-        return empty
+        return pd.DataFrame(), 0, 0, 0.0
 
     g = (
         df.groupby(["Region", "Retailer", "date_key"])
@@ -892,85 +916,96 @@ def opportunity_pareto(df, future_dates, cpi_inflation, pareto_target):
         ((df["Baseline Units"] - df["Sales Units"]).abs()
          > 1e-6 * df["Sales Units"].abs().clip(lower=1)).mean() > 0.5
     )
-    all_dates = sorted(df["date_key"].unique())
-    recent_dates = all_dates[-FOCUS_TREND_WEEKS:]
-    dist_dates = all_dates[-FOCUS_DIST_LOOKBACK:]
+    global_last = df["date_key"].max()
+    horizon = len(future_dates)
 
-    def mean_or_nan(values):
-        values = values[np.isfinite(values)]
-        return float(values.mean()) if values.size else np.nan
+    # Distribution upside is measured SKU by SKU (see distribution_fix_list), so a SKU that
+    # lost listings is caught even when the combination's average distribution looks fine.
+    dist_fix, _ = distribution_fix_list(df, horizon, pareto_target)
+    dist_lookup = dist_fix.set_index(["Region", "Retailer"]) if not dist_fix.empty else None
 
     rows, evaluated, skipped, total_proj_value = [], 0, 0, 0.0
     for (region, retailer), grp in g.groupby(["Region", "Retailer"]):
         s = grp.set_index("date_key").sort_index()
-
-        def near(col, dates, weeks_back):
-            return np.array([_value_near(s[col], pd.Timestamp(d) - timedelta(weeks=weeks_back)) for d in dates])
-
-        ly_u = near("units", recent_dates, 52)
-        ok = np.isfinite(ly_u) & (ly_u > 0)
-        fut_ly_u, fut_ly_v = near("units", future_dates, 52), near("value", future_dates, 52)
-        fut_ok = np.isfinite(fut_ly_u) & np.isfinite(fut_ly_v)
-        if ok.sum() < 4 or not fut_ok.any():
+        if len(s) < 4:
             skipped += 1
             continue
         evaluated += 1
 
-        # A week with no row this year but sales last year is treated as zero (e.g. delisted).
-        now_u = np.nan_to_num(near("units", recent_dates, 0))
-        now_v = np.nan_to_num(near("value", recent_dates, 0))
-        ly_v = np.nan_to_num(near("value", recent_dates, 52))
+        own_last = s.index[-1]
+        stale = (global_last - own_last).days > FOCUS_STALE_DAYS
+        base = global_last if stale else own_last
+        recent = [base - timedelta(weeks=k) for k in range(FOCUS_TREND_WEEKS - 1, -1, -1)]
+        future = [base + timedelta(weeks=k) for k in range(1, horizon + 1)]
 
-        trend = float(np.clip(now_u[ok].sum() / ly_u[ok].sum(), 0.0, 2.0))
-        ly_value = float(fut_ly_v[fut_ok].sum())
-        proj_value = ly_value * trend
+        def near(col, dates, weeks_back):
+            return np.array([_value_near(s[col], pd.Timestamp(d) - timedelta(weeks=weeks_back)) for d in dates])
+
+        # A week with no row this year is treated as zero sales (e.g. delisted).
+        now_u = np.nan_to_num(near("units", recent, 0))
+        now_v = np.nan_to_num(near("value", recent, 0))
+        ly_u = near("units", recent, 52)
+        ly_v = np.nan_to_num(near("value", recent, 52))
+        ok = np.isfinite(ly_u) & (ly_u > 0)
+        fut_ly_v = near("value", future, 52)
+        fut_ok = np.isfinite(fut_ly_v)
+        has_ly = ok.sum() >= 4 and fut_ok.any()
+
+        run_rate = float(s.loc[s["value"] > 0, "value"].iloc[-4:].mean()) if (s["value"] > 0).any() else 0.0
+        if has_ly:
+            trend = float(np.clip(now_u[ok].sum() / ly_u[ok].sum(), 0.0, 2.0))
+            ly_value = float(fut_ly_v[fut_ok].sum()) * horizon / int(fut_ok.sum())
+            proj_value = ly_value * trend
+            recovery = max(0.0, ly_value - proj_value)
+        else:
+            trend, ly_value = np.nan, np.nan
+            proj_value = 0.0 if stale else run_rate * horizon
+            recovery = run_rate * horizon if stale else 0.0
         total_proj_value += proj_value
 
-        # ---- Upside 1: recover to last year
-        recovery = max(0.0, ly_value - proj_value)
-
-        # ---- Upside 2: distribution headroom
-        d_now = mean_or_nan(near("dist", recent_dates[-4:], 0))
-        d_ly = mean_or_nan(near("dist", recent_dates[-4:], 52))
-        d_best = np.nanmax(near("dist", dist_dates, 0)) if np.isfinite(near("dist", dist_dates, 0)).any() else np.nan
-        d_target = np.nanmax([d_ly, d_best]) if np.isfinite([d_ly, d_best]).any() else np.nan
-        dist_pts = d_target - d_now if np.isfinite(d_now) and np.isfinite(d_target) else np.nan
-        dist_opp = 0.0
-        if np.isfinite(dist_pts) and dist_pts >= 1 and d_now > 0:
-            dist_opp = proj_value * min(dist_pts / d_now, FOCUS_MAX_DIST_GAIN)
+        pos = _dist_position(s["dist"], global_last)
+        d_now = pos["now"] if pos else np.nan
+        d_target = pos["target"] if pos else np.nan
+        dist_opp, dist_detail = 0.0, ""
+        if dist_lookup is not None and (region, retailer) in dist_lookup.index:
+            fix = dist_lookup.loc[(region, retailer)]
+            dist_opp = float(fix["Upside (R)"])
+            dist_detail = f"Distribution gaps on {int(fix['SKUs to fix'])} SKU(s): {fix['Biggest SKU gaps']}"
 
         opportunity = max(recovery, dist_opp)
 
-        # ---- Diagnose the lever
-        p_now = now_v[ok].sum() / now_u[ok].sum() if now_u[ok].sum() > 0 else np.nan
-        p_ly = ly_v[ok].sum() / ly_u[ok].sum()
-        price_yoy = (p_now / p_ly - 1) * 100 if np.isfinite(p_now) and p_ly > 0 else np.nan
+        price_yoy, promo_chg = np.nan, np.nan
+        if has_ly:
+            p_now = now_v[ok].sum() / now_u[ok].sum() if now_u[ok].sum() > 0 else np.nan
+            p_ly = ly_v[ok].sum() / ly_u[ok].sum()
+            price_yoy = (p_now / p_ly - 1) * 100 if np.isfinite(p_now) and p_ly > 0 else np.nan
+            if baseline_real:
+                b_now, b_ly = np.nan_to_num(near("base", recent, 0)), np.nan_to_num(near("base", recent, 52))
+                if b_now[ok].sum() > 0 and b_ly[ok].sum() > 0:
+                    promo_chg = (now_u[ok].sum() / b_now[ok].sum() - ly_u[ok].sum() / b_ly[ok].sum()) * 100
 
-        promo_chg = np.nan
-        if baseline_real:
-            b_now, b_ly = np.nan_to_num(near("base", recent_dates, 0)), np.nan_to_num(near("base", recent_dates, 52))
-            if b_now[ok].sum() > 0 and b_ly[ok].sum() > 0:
-                promo_chg = (now_u[ok].sum() / b_now[ok].sum() - ly_u[ok].sum() / b_ly[ok].sum()) * 100
-
+        dist_cause = ("Distribution", dist_detail,
+                      "Fix distribution: see the Distribution fix list for the SKUs to restore.")
         causes = []
-        if trend == 0:
-            causes.append(("Distribution", "No sales in recent weeks (possible delisting)",
+        if stale or trend == 0:
+            causes.append(("Distribution", f"No sales since {own_last:%d %b %Y} (possible delisting)",
                            "Confirm the listing with the buyer and restore ranging."))
         if dist_opp > 0 and dist_opp >= recovery:
-            causes.append(("Distribution", f"Distribution {d_now:.0f}% vs {d_target:.0f}% achievable",
-                           f"Lift distribution {d_now:.0f}% → {d_target:.0f}%: fix out-of-stocks and regain listings."))
+            causes.append(dist_cause)
         if np.isfinite(price_yoy) and price_yoy - cpi_inflation > 2:
             causes.append(("Price", f"Price {price_yoy:+.1f}% vs LY (CPI {cpi_inflation:.1f}%)",
                            "Review shelf price or price-pack architecture with the retailer."))
         if np.isfinite(promo_chg) and promo_chg <= -5:
             causes.append(("Promotion", f"Promo uplift {promo_chg:+.0f} pts vs LY",
                            "Rebuild the promo calendar to at least last year's level."))
-        if dist_opp > 0 and not any(c[0] == "Distribution" for c in causes):
-            causes.append(("Distribution", f"Distribution {d_now:.0f}% vs {d_target:.0f}% achievable",
-                           f"Lift distribution {d_now:.0f}% → {d_target:.0f}%: fix out-of-stocks and regain listings."))
+        if dist_opp > 0 and dist_cause not in causes:
+            causes.append(dist_cause)
         if not causes:
             causes.append(("Demand", "No clear price, distribution or promo cause",
                            "Joint business review: range, shelf space and competitor activity."))
+        why = "; ".join(c[1] for c in causes)
+        if not has_ly:
+            why += "; no last-year history for this combination, so only distribution upside is measured"
 
         rows.append({
             "Region": region,
@@ -980,13 +1015,13 @@ def opportunity_pareto(df, future_dates, cpi_inflation, pareto_target):
             "Distribution upside (R)": dist_opp,
             "Projected revenue (R)": proj_value,
             "LY revenue (R)": ly_value,
-            "Trend vs LY %": (trend - 1) * 100,
+            "Trend vs LY %": (trend - 1) * 100 if np.isfinite(trend) else np.nan,
             "Price vs LY %": price_yoy,
             "Distribution now %": d_now,
             "Distribution target %": d_target,
             "Lever": causes[0][0],
             "Focus action": causes[0][2],
-            "Why": "; ".join(c[1] for c in causes),
+            "Why": why,
         })
 
     if not rows:
@@ -1002,6 +1037,94 @@ def opportunity_pareto(df, future_dates, cpi_inflation, pareto_target):
     out["Cumulative %"] = out["Share %"].cumsum()
     out["Vital few"] = (out["Cumulative %"] - out["Share %"]) < pareto_target
     return out, evaluated, skipped, total_proj_value
+
+
+@st.cache_data(show_spinner=False)
+def distribution_fix_list(df, horizon, pareto_target):
+    """
+    Region x Retailer combinations where Unilever must go and fix distribution.
+
+    Checked SKU by SKU inside each combination: a SKU is flagged when its numeric distribution
+    is FOCUS_DIST_MIN_GAP+ points below what it has achieved (last year or its best recent
+    4 weeks), or it has stopped reporting (possible delisting). Revenue upside assumes sales
+    scale with the share of stores stocking. Combinations are ranked 80/20 by upside.
+    Returns (combination table, SKU table).
+    """
+    d = df.dropna(subset=["CY Numeric Distribution"])
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    global_last = df["date_key"].max()
+    g = (
+        d.groupby(["Region", "Retailer", "Product", "date_key"])
+        .agg(dist=("CY Numeric Distribution", "mean"), value=("Sales Value", "sum"))
+        .reset_index()
+    )
+
+    sku_rows = []
+    for (region, retailer, product), grp in g.groupby(["Region", "Retailer", "Product"]):
+        s = grp.set_index("date_key").sort_index()
+        if len(s) < 4:
+            continue
+        pos = _dist_position(s["dist"], global_last)
+        if pos is None or not np.isfinite(pos["target"]):
+            continue
+        gap = pos["target"] - pos["now"]
+        if gap < FOCUS_DIST_MIN_GAP:
+            continue
+
+        selling = s.loc[s["value"] > 0, "value"]
+        if pos["now"] > 0:
+            weekly_value = float(s["value"].iloc[-4:].mean())
+            upside = weekly_value * horizon * min(gap / pos["now"], FOCUS_MAX_DIST_GAIN)
+            status = "Below achievable"
+        else:
+            weekly_value = float(selling.iloc[-4:].mean()) if not selling.empty else 0.0
+            upside = weekly_value * horizon
+            status = f"Not stocked since {pos['last']:%d %b %Y} (possible delisting)"
+
+        sku_rows.append({
+            "Region": region, "Retailer": retailer, "Product": product,
+            "Distribution now %": pos["now"], "Last year %": pos["ly"], "Recent best %": pos["best"],
+            "Target %": pos["target"], "Gap (pts)": gap, "Upside (R)": upside, "Status": status,
+        })
+
+    if not sku_rows:
+        return pd.DataFrame(), pd.DataFrame()
+
+    sku = pd.DataFrame(sku_rows).sort_values("Upside (R)", ascending=False).reset_index(drop=True)
+
+    combos = []
+    for (region, retailer), grp in sku.groupby(["Region", "Retailer"]):
+        grp = grp.sort_values("Upside (R)", ascending=False)
+        delisted = int(grp["Status"].str.startswith("Not stocked").sum())
+        top = "; ".join(f"{r.Product} ({r['Distribution now %']:.0f}% → {r['Target %']:.0f}%)"
+                        for _, r in grp.head(3).iterrows())
+        if len(grp) > 3:
+            top += f"; +{len(grp) - 3} more"
+        if delisted:
+            action = (f"Restore the listing for {delisted} SKU(s) with the buyer"
+                      + (f" and fix out-of-stocks on {len(grp) - delisted} more." if len(grp) > delisted else "."))
+        else:
+            action = f"Fix out-of-stocks and regain listings for {len(grp)} SKU(s)."
+        combos.append({
+            "Region": region, "Retailer": retailer,
+            "Upside (R)": float(grp["Upside (R)"].sum()),
+            "SKUs to fix": len(grp),
+            "Possible delistings": delisted,
+            "Avg distribution now %": float(grp["Distribution now %"].mean()),
+            "Avg target %": float(grp["Target %"].mean()),
+            "Avg gap (pts)": float(grp["Gap (pts)"].mean()),
+            "Action": action,
+            "Biggest SKU gaps": top,
+        })
+
+    combo = pd.DataFrame(combos).sort_values("Upside (R)", ascending=False).reset_index(drop=True)
+    combo.insert(0, "Rank", np.arange(1, len(combo) + 1))
+    combo["Share %"] = combo["Upside (R)"] / combo["Upside (R)"].sum() * 100
+    combo["Cumulative %"] = combo["Share %"].cumsum()
+    combo["Vital few"] = (combo["Cumulative %"] - combo["Share %"]) < pareto_target
+    return combo, sku
 
 
 # ============================================================
@@ -1430,8 +1553,63 @@ else:
                f"Achievable distribution = the higher of last year and the best of the last {FOCUS_DIST_LOOKBACK} weeks.")
 
 if opp_skipped:
-    st.caption(f"{opp_skipped} combination(s) were left out because they don't have enough history "
-               "to compare with last year.")
+    st.caption(f"{opp_skipped} combination(s) were left out because they have fewer than 4 weeks of data.")
+
+
+# ---- Distribution fix list
+st.markdown("### Distribution fix list: where to go and fix distribution")
+st.caption("Region × Retailer combinations where at least one SKU's numeric distribution is "
+           f"{FOCUS_DIST_MIN_GAP:.0f}+ points below what it has achieved (last year, or its best 4 weeks in the "
+           f"last {FOCUS_DIST_LOOKBACK}), or has stopped reporting. Ranked by the revenue regained over the "
+           f"{forecast_horizon} forecast weeks, assuming sales scale with the share of stores stocking.")
+
+if focus_df["CY Numeric Distribution"].dropna().empty:
+    st.info("The extract has no CY Numeric Distribution data for this selection, so the fix list can't be built.")
+else:
+    dist_fix, dist_sku = distribution_fix_list(focus_df, forecast_horizon, pareto_target)
+    if dist_fix.empty:
+        st.success(f"No Region × Retailer combination is {FOCUS_DIST_MIN_GAP:.0f}+ points below its "
+                   "achievable distribution. Distribution is not the lever to pull here.")
+    else:
+        dv = dist_fix[dist_fix["Vital few"]]
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Combinations to fix", f"{len(dist_fix)}")
+        k2.metric("SKU listings to fix", f"{int(dist_fix['SKUs to fix'].sum())}",
+                  delta=f"{int(dist_fix['Possible delistings'].sum())} possible delisting(s)", delta_color="off")
+        k3.metric("Revenue upside", f"R {dist_fix['Upside (R)'].sum():,.0f}")
+        k4.metric(f"Vital few ({pareto_target}% of upside)", f"{len(dv)} combination(s)")
+
+        st.markdown(f"**Start with these {len(dv)}:** "
+                    + ", ".join(f"{r.Region} · {r.Retailer}" for _, r in dv.iterrows()) + ".")
+
+        dcols = ["Rank", "Region", "Retailer", "Upside (R)", "Share %", "Cumulative %", "SKUs to fix",
+                 "Possible delistings", "Avg distribution now %", "Avg target %", "Avg gap (pts)",
+                 "Action", "Biggest SKU gaps"]
+        dfmt = {"Upside (R)": "R {:,.0f}", "Share %": "{:.1f}%", "Cumulative %": "{:.0f}%",
+                "Avg distribution now %": "{:.1f}", "Avg target %": "{:.1f}", "Avg gap (pts)": "{:+.1f}"}
+        st.dataframe(dv[dcols].style.format(dfmt, na_rep="-"), width="stretch", hide_index=True)
+
+        rest_d = dist_fix[~dist_fix["Vital few"]]
+        if not rest_d.empty:
+            with st.expander(f"The other {len(rest_d)} combination(s) to fix "
+                             f"({rest_d['Share %'].sum():.0f}% of the upside)"):
+                st.dataframe(rest_d[dcols].style.format(dfmt, na_rep="-"), width="stretch", hide_index=True)
+
+        with st.expander(f"SKU detail: every listing to fix ({len(dist_sku)})"):
+            st.dataframe(
+                dist_sku.style.format({
+                    "Distribution now %": "{:.1f}", "Last year %": "{:.1f}", "Recent best %": "{:.1f}",
+                    "Target %": "{:.1f}", "Gap (pts)": "{:+.1f}", "Upside (R)": "R {:,.0f}",
+                }, na_rep="-"),
+                width="stretch", hide_index=True,
+            )
+
+        b1, b2 = st.columns(2)
+        b1.download_button("Download distribution fix list (CSV)",
+                           dist_fix[dcols + ["Vital few"]].to_csv(index=False).encode("utf-8"),
+                           file_name=f"distribution_fix_list_{last_date:%Y%m%d}.csv", mime="text/csv")
+        b2.download_button("Download SKU-level fix list (CSV)", dist_sku.to_csv(index=False).encode("utf-8"),
+                           file_name=f"distribution_fix_skus_{last_date:%Y%m%d}.csv", mime="text/csv")
 
 
 # ============================================================
