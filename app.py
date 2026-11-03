@@ -10,8 +10,6 @@ What the tool does, in plain terms:
   4. If the forecast is below last year, it sizes three recovery levers
      - Price, Promotion and Distribution - from your own data and recommends
      the one that closes the most of the decline for the best revenue result.
-  5. Ranks Region x Retailer combinations by revenue at risk versus last year,
-     with the likely cause and where Unilever should concentrate first.
 """
 
 import math
@@ -41,8 +39,6 @@ PAYDAY_GRID = [(lo, hi, mode) for lo in (23, 25, 28) for hi in (1, 3, 5) for mod
 PAYDAY_MAX_EFFECT = 0.25             # max log-uplift per payday day in the week
 PARTIAL_WEEK_SHARE = 0.60            # edge weeks with < 60% of the usual row count are incomplete
 TIE_BAND_PCT = 10.0                  # levers within 10 pts of gap closure compete on revenue
-FOCUS_TREND_WEEKS = 8                # recent weeks used for each Region x Retailer YoY trend
-FOCUS_PARETO_SHARE = 80.0            # combos making up the first 80% of the decline are "High" priority
 
 
 # ============================================================
@@ -66,7 +62,6 @@ MEASURE_SETS = {
 }
 
 BASE_COLUMNS = ["Full Date", "Region", "Retailer", "Brand", "Category", "Product", "Subcategory"]
-TEXT_COLUMNS = ["Region", "Retailer", "Category", "Subcategory", "Brand", "Product"]
 
 
 # ============================================================
@@ -223,11 +218,9 @@ def validate_and_prepare(raw_df):
         df["CY Numeric Distribution"] = np.nan
         warnings_list.append("No 'CY Numeric Distribution' column found; distribution recommendations are disabled.")
 
-    # Text fields: fill blanks and trim stray spaces so filter values group cleanly
-    # (e.g. "Shoprite" and "Shoprite " become one retailer).
-    for col in TEXT_COLUMNS:
-        df[col] = df[col].fillna("Unknown").astype(str).str.strip()
-
+    for col in ["Category", "Subcategory", "Brand", "Product"]:
+        df[col] = df[col].fillna("Unknown").astype(str)
+    
     return True, errors, warnings_list, df.sort_values("date_key").reset_index(drop=True), measure_window
 
 
@@ -857,126 +850,6 @@ def rank_levers(levers):
 
 
 # ============================================================
-# 7b. WHERE TO FOCUS: REGION x RETAILER PRIORITIES
-# ============================================================
-@st.cache_data(show_spinner=False)
-def region_retailer_focus(df, future_dates, cpi_inflation):
-    """
-    Ranks every Region x Retailer combination by revenue at risk in the forecast weeks.
-
-    Quick projection per combination (fast enough to run on every combination):
-        projected = same weeks last year x recent YoY trend
-        recent YoY trend = last FOCUS_TREND_WEEKS weeks / the same weeks last year
-    Each combination is then diagnosed: distribution lost, price running ahead of CPI,
-    or weaker promotional uplift than last year.
-    """
-    if df.empty:
-        return pd.DataFrame(), 0
-
-    g = (
-        df.groupby(["Region", "Retailer", "date_key"])
-        .agg(units=("Sales Units", "sum"), value=("Sales Value", "sum"),
-             base=("Baseline Units", "sum"), dist=("CY Numeric Distribution", "mean"))
-        .reset_index()
-    )
-    baseline_real = bool(
-        ((df["Baseline Units"] - df["Sales Units"]).abs()
-         > 1e-6 * df["Sales Units"].abs().clip(lower=1)).mean() > 0.5
-    )
-    recent_dates = sorted(df["date_key"].unique())[-FOCUS_TREND_WEEKS:]
-
-    rows, skipped = [], 0
-    for (region, retailer), grp in g.groupby(["Region", "Retailer"]):
-        s = grp.set_index("date_key").sort_index()
-
-        def near(col, dates, weeks_back):
-            return np.array([_value_near(s[col], pd.Timestamp(d) - timedelta(weeks=weeks_back)) for d in dates])
-
-        ly_u = near("units", recent_dates, 52)
-        ok = np.isfinite(ly_u) & (ly_u > 0)
-        fut_ly_u, fut_ly_v = near("units", future_dates, 52), near("value", future_dates, 52)
-        fut_ok = np.isfinite(fut_ly_u) & np.isfinite(fut_ly_v)
-        if ok.sum() < 4 or not fut_ok.any():
-            skipped += 1
-            continue
-
-        # A week with no row this year but sales last year is treated as zero (e.g. delisted).
-        now_u = np.nan_to_num(near("units", recent_dates, 0))
-        now_v = np.nan_to_num(near("value", recent_dates, 0))
-        ly_v = np.nan_to_num(near("value", recent_dates, 52))
-
-        trend = float(np.clip(now_u[ok].sum() / ly_u[ok].sum(), 0.0, 2.0))
-        ly_units, ly_value = float(fut_ly_u[fut_ok].sum()), float(fut_ly_v[fut_ok].sum())
-        proj_units = ly_units * trend
-
-        # ---- Diagnose the likely cause
-        p_now = now_v[ok].sum() / now_u[ok].sum() if now_u[ok].sum() > 0 else np.nan
-        p_ly = ly_v[ok].sum() / ly_u[ok].sum()
-        price_yoy = (p_now / p_ly - 1) * 100 if np.isfinite(p_now) and p_ly > 0 else np.nan
-
-        def mean_or_nan(values):
-            values = values[np.isfinite(values)]
-            return float(values.mean()) if values.size else np.nan
-
-        d_now = mean_or_nan(near("dist", recent_dates[-4:], 0))
-        d_ly = mean_or_nan(near("dist", recent_dates[-4:], 52))
-        dist_chg = d_now - d_ly if np.isfinite(d_now) and np.isfinite(d_ly) else np.nan
-
-        promo_chg = np.nan
-        if baseline_real:
-            b_now, b_ly = np.nan_to_num(near("base", recent_dates, 0)), np.nan_to_num(near("base", recent_dates, 52))
-            if b_now[ok].sum() > 0 and b_ly[ok].sum() > 0:
-                promo_chg = (now_u[ok].sum() / b_now[ok].sum() - ly_u[ok].sum() / b_ly[ok].sum()) * 100
-
-        causes = []
-        if trend == 0:
-            causes.append(("Distribution", "No sales in recent weeks (possible delisting)",
-                           "Confirm the listing with the buyer and restore ranging."))
-        if np.isfinite(dist_chg) and dist_chg <= -2:
-            causes.append(("Distribution", f"Distribution {dist_chg:+.1f} pts vs LY",
-                           "Fix out-of-stocks and regain lost listings in this retailer."))
-        if np.isfinite(price_yoy) and price_yoy - cpi_inflation > 2:
-            causes.append(("Price", f"Price {price_yoy:+.1f}% vs LY (CPI {cpi_inflation:.1f}%)",
-                           "Review shelf price or price-pack architecture with the retailer."))
-        if np.isfinite(promo_chg) and promo_chg <= -5:
-            causes.append(("Promotion", f"Promo uplift {promo_chg:+.0f} pts vs LY",
-                           "Rebuild the promo calendar to at least last year's level."))
-        if not causes:
-            causes.append(("Demand", "No clear price, distribution or promo cause",
-                           "Review with the customer: range, shelf space, competitor activity."))
-
-        rows.append({
-            "Region": region,
-            "Retailer": retailer,
-            "LY units": ly_units,
-            "Projected units": proj_units,
-            "Units gap": ly_units - proj_units,
-            "Revenue at risk (R)": ly_value * (1 - trend),
-            "Recent trend vs LY %": (trend - 1) * 100,
-            "Price vs LY %": price_yoy,
-            "Distribution vs LY (pts)": dist_chg,
-            "Main issue": causes[0][0],
-            "Why": "; ".join(c[1] for c in causes),
-            "Focus action": causes[0][2],
-        })
-
-    if not rows:
-        return pd.DataFrame(), skipped
-
-    out = pd.DataFrame(rows)
-    out = out[out["Revenue at risk (R)"] > 0].sort_values("Revenue at risk (R)", ascending=False)
-    if out.empty:
-        return out, skipped
-
-    out["Share of decline %"] = out["Revenue at risk (R)"] / out["Revenue at risk (R)"].sum() * 100
-    cum_before = out["Share of decline %"].cumsum() - out["Share of decline %"]
-    out["Priority"] = np.select(
-        [cum_before < FOCUS_PARETO_SHARE, cum_before < 95], ["High", "Medium"], default="Low"
-    )
-    return out.reset_index(drop=True), skipped
-
-
-# ============================================================
 # 8. PAGE SETUP & STYLING
 # ============================================================
 st.set_page_config(page_title="Unilever Demand & Recovery Planner", page_icon="📦", layout="wide")
@@ -1039,19 +912,9 @@ if not valid:
 
 with st.sidebar:
     st.header("2. Choose what to forecast")
-
-    # Region and Retailer come first; each choice narrows the lists below it.
-    regions = ["All"] + sorted(df_clean["Region"].unique().tolist())
-    region = st.selectbox("Region", regions)
-    r1 = df_clean if region == "All" else df_clean[df_clean["Region"] == region]
-
-    retailers = ["All"] + sorted(r1["Retailer"].unique().tolist())
-    retailer = st.selectbox("Retailer", retailers)
-    r2 = r1 if retailer == "All" else r1[r1["Retailer"] == retailer]
-
-    categories = ["All"] + sorted(r2["Category"].unique().tolist())
+    categories = ["All"] + sorted(df_clean["Category"].unique().tolist())
     category = st.selectbox("Category", categories)
-    d1 = r2 if category == "All" else r2[r2["Category"] == category]
+    d1 = df_clean if category == "All" else df_clean[df_clean["Category"] == category]
 
     subcategories = ["All"] + sorted(d1["Subcategory"].unique().tolist())
     subcategory = st.selectbox("Subcategory", subcategories)
@@ -1100,14 +963,6 @@ if final_df.empty:
 # ============================================================
 # 10. FORECAST COMPUTATION
 # ============================================================
-# Product scope across ALL regions and retailers, for the "where to focus" ranking.
-focus_df = df_clean
-for col, choice in [("Category", category), ("Subcategory", subcategory), ("Brand", brand)]:
-    if choice != "All":
-        focus_df = focus_df[focus_df[col] == choice]
-if not ("All" in selected_products or not selected_products):
-    focus_df = focus_df[focus_df["Product"].isin(selected_products)]
-
 weekly = aggregate_weekly(final_df)
 if len(weekly) < 4:
     st.error("At least 4 weeks of history are needed for this selection. Widen the filters or upload more weeks.")
@@ -1176,9 +1031,7 @@ is_decline = n_matched > 0 and gap_units > 0
 # ============================================================
 # 11. HEADLINE NUMBERS
 # ============================================================
-region_label = region if region != "All" else "All regions"
-retailer_label = retailer if retailer != "All" else "All retailers"
-scope_label = " › ".join([region_label, retailer_label, category, subcategory, brand, product_label])
+scope_label = " › ".join([category, subcategory, brand, product_label])
 st.markdown(f"#### {scope_label}")
 
 if warning_list:
@@ -1188,9 +1041,6 @@ if warning_list:
 if forecast_source != "Baseline Units" and np.isfinite(baseline_ratio):
     st.caption(f"Baseline not used for forecasting (median baseline/actual = {baseline_ratio:.2f}x); "
                "forecasting actual sales instead.")
-if retailer == "All" and final_df["Retailer"].nunique() > 1:
-    st.caption("Distribution figures are a simple average across retailers. "
-               "Select a single retailer for distribution recommendations you can act on.")
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric(f"{forecast_horizon}-week volume forecast", f"{final_units.sum():,.0f} units")
@@ -1289,62 +1139,6 @@ elif n_matched:
         </div>""",
         unsafe_allow_html=True,
     )
-
-
-# ============================================================
-# 12b. WHERE TO FOCUS: REGION x RETAILER
-# ============================================================
-st.subheader("Where to focus: Region × Retailer")
-product_scope = " › ".join([category, subcategory, brand, product_label])
-st.caption(f"All regions and retailers for {product_scope}, ranked by revenue at risk in the "
-           f"{forecast_horizon} forecast weeks versus the same weeks last year. Region and Retailer "
-           "filters in the sidebar don't apply here, so you can see the full picture.")
-
-with st.spinner("Ranking region and retailer combinations..."):
-    focus, focus_skipped = region_retailer_focus(focus_df, tuple(future_dates), cpi_inflation)
-
-if focus.empty:
-    st.success("No Region × Retailer combination is trending below last year for this product scope.")
-else:
-    high = focus[focus["Priority"] == "High"]
-    st.markdown(
-        f"**{len(high)} of {len(focus)} declining combination(s) make up about "
-        f"{high['Share of decline %'].sum():.0f}% of the revenue at risk** "
-        f"(R {focus['Revenue at risk (R)'].sum():,.0f} in total). Start with these."
-    )
-
-    top = focus.head(10).iloc[::-1]
-    colours = {"High": "#B91C1C", "Medium": "#D97706", "Low": "#94A3B8"}
-    bar = go.Figure(go.Bar(
-        x=top["Revenue at risk (R)"], y=top["Region"] + " · " + top["Retailer"], orientation="h",
-        marker_color=[colours[p] for p in top["Priority"]],
-        text=top["Main issue"], textposition="auto",
-        hovertemplate="%{y}<br>Revenue at risk: R %{x:,.0f}<extra></extra>",
-    ))
-    bar.update_layout(template="plotly_white", height=max(260, 34 * len(top) + 80),
-                      margin=dict(l=10, r=30, t=20, b=40), xaxis_title="Revenue at risk (R)")
-    st.plotly_chart(bar, width="stretch")
-
-    shown_focus = focus[[
-        "Priority", "Region", "Retailer", "Revenue at risk (R)", "Share of decline %", "Units gap",
-        "Recent trend vs LY %", "Price vs LY %", "Distribution vs LY (pts)", "Main issue", "Focus action", "Why",
-    ]]
-    st.dataframe(
-        shown_focus.style.format({
-            "Revenue at risk (R)": "R {:,.0f}", "Share of decline %": "{:.1f}%", "Units gap": "{:,.0f}",
-            "Recent trend vs LY %": "{:+.1f}%", "Price vs LY %": "{:+.1f}%", "Distribution vs LY (pts)": "{:+.1f}",
-        }, na_rep="-"),
-        width="stretch", hide_index=True,
-    )
-    st.download_button("Download focus list (CSV)", shown_focus.to_csv(index=False).encode("utf-8"),
-                       file_name=f"focus_region_retailer_{last_date:%Y%m%d}.csv", mime="text/csv")
-    st.caption(f"Projection per combination = same weeks last year × its trend over the last {FOCUS_TREND_WEEKS} "
-               "weeks vs the same weeks last year. This is a quick method so every combination can be compared, "
-               "so totals won't match the headline forecast exactly. High = the combinations making up the first "
-               f"{FOCUS_PARETO_SHARE:.0f}% of the revenue at risk.")
-if focus_skipped:
-    st.caption(f"{focus_skipped} combination(s) were left out because they don't have enough history "
-               "to compare with last year.")
 
 
 # ============================================================
